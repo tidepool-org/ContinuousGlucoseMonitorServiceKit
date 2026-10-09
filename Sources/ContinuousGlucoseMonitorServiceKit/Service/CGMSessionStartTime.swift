@@ -39,6 +39,9 @@ public struct CGMSessionStartTime: Equatable, Codable, Sendable {
     public static let baseSize = 9
     public static let unknownTimeZone: Int8 = -128
 
+    /// GSS Time Zone: UTC-12:00 to UTC+14:00 in 15-minute increments.
+    public static let timeZoneOffsetRange: ClosedRange<Int8> = -48...56
+
     /// Absolute instant of the session start.
     public var date: Date
 
@@ -66,7 +69,11 @@ public struct CGMSessionStartTime: Equatable, Codable, Sendable {
 
     /// Fixed-offset zone the Date Time octets are expressed in; UTC when the offset is unknown.
     public var localTimeZone: TimeZone {
-        guard timeZoneOffset != Self.unknownTimeZone else { return .utc }
+        Self.localTimeZone(timeZoneOffset: timeZoneOffset, dstOffset: dstOffset)
+    }
+
+    static func localTimeZone(timeZoneOffset: Int8, dstOffset: CGMDSTOffset) -> TimeZone {
+        guard timeZoneOffset != unknownTimeZone else { return .utc }
         let seconds = Int(timeZoneOffset) * 15 * 60 + (dstOffset.seconds ?? 0)
         return TimeZone(secondsFromGMT: seconds) ?? .utc
     }
@@ -79,7 +86,7 @@ public struct CGMSessionStartTime: Equatable, Codable, Sendable {
     }
 
     public init(data: Data, e2eCRC: Bool) throws {
-        let expected = Self.baseSize + (e2eCRC ? CGMMeasurementRecord.crcSize : 0)
+        let expected = Self.baseSize + (e2eCRC ? CGME2ECRC.size : 0)
         guard data.count == expected else {
             throw CGMCodecError.truncated(expected: expected, actual: data.count)
         }
@@ -91,18 +98,20 @@ public struct CGMSessionStartTime: Equatable, Codable, Sendable {
         let dateTime = try reader.readBytes(7)
         let rawTimeZone = try reader.read(UInt8.self)
         let timeZoneOffset = Int8(bitPattern: rawTimeZone)
+        guard timeZoneOffset == Self.unknownTimeZone || Self.timeZoneOffsetRange.contains(timeZoneOffset) else {
+            throw CGMCodecError.invalidValue("Time Zone \(timeZoneOffset)")
+        }
         let rawDST = try reader.read(UInt8.self)
         guard let dstOffset = CGMDSTOffset(rawValue: rawDST) else {
             throw CGMCodecError.invalidValue("DST Offset \(rawDST)")
         }
 
-        // Resolve the zone first so the wall-clock octets map to the right instant.
-        var startTime = CGMSessionStartTime(date: Date(), timeZoneOffset: timeZoneOffset, dstOffset: dstOffset)
-        guard let date = Date(gattDateTime: dateTime, timeZone: startTime.localTimeZone) else {
+        // The wall-clock octets are expressed in the zone the trailing two octets describe.
+        let zone = Self.localTimeZone(timeZoneOffset: timeZoneOffset, dstOffset: dstOffset)
+        guard let date = Date(gattDateTime: dateTime, timeZone: zone) else {
             throw CGMCodecError.invalidValue("Date Time \(dateTime.hexadecimalString)")
         }
-        startTime.date = date
-        self = startTime
+        self.init(date: date, timeZoneOffset: timeZoneOffset, dstOffset: dstOffset)
     }
 }
 
@@ -122,7 +131,7 @@ public struct CGMSessionRunTime: Equatable, Codable, Sendable {
     }
 
     public init(data: Data, e2eCRC: Bool) throws {
-        let expected = Self.baseSize + (e2eCRC ? CGMMeasurementRecord.crcSize : 0)
+        let expected = Self.baseSize + (e2eCRC ? CGME2ECRC.size : 0)
         guard data.count == expected else {
             throw CGMCodecError.truncated(expected: expected, actual: data.count)
         }

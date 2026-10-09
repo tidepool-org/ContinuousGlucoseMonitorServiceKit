@@ -43,6 +43,8 @@ public struct CGMFeatureFlags: OptionSet, Hashable, Codable, Sendable {
     public var data: Data {
         Data(rawValue).dropLast(1)
     }
+
+    // Codable comes from RawRepresentable and decodes through init(rawValue:), so persisted values are masked.
 }
 
 /// Low nibble of the Type-Sample Location octet.
@@ -99,7 +101,10 @@ public struct CGMFeature: Equatable, Codable, Sendable {
         return data
     }
 
-    public init(data: Data) throws {
+    /// - Parameter e2eCRC: pass `true` when the collector already knows the sensor supports E2E-CRC, so the
+    ///   check cannot be switched off by a corrupted E2E bit in this very payload. On a first read nothing is
+    ///   known yet and the payload's own bit decides, which is what the always-present CRC field is for.
+    public init(data: Data, e2eCRC: Bool = false) throws {
         guard data.count == Self.encodedSize else {
             throw CGMCodecError.truncated(expected: Self.encodedSize, actual: data.count)
         }
@@ -109,16 +114,17 @@ public struct CGMFeature: Equatable, Codable, Sendable {
         let flagsHigh = try reader.read(UInt8.self)
         let flags = CGMFeatureFlags(rawValue: UInt32(flagsLow) | UInt32(flagsHigh) << 16)
 
+        // Integrity first, so a corrupted payload is reported as a CRC failure rather than a bad field.
+        if e2eCRC || flags.contains(.e2eCRC), !data.isCRCValid {
+            throw CGMCodecError.invalidCRC
+        }
+
         let typeSampleLocation = try reader.read(UInt8.self)
         guard let type = CGMType(rawValue: typeSampleLocation & 0x0F) else {
             throw CGMCodecError.invalidValue("CGM Type \(typeSampleLocation & 0x0F)")
         }
         guard let sampleLocation = CGMSampleLocation(rawValue: typeSampleLocation >> 4) else {
             throw CGMCodecError.invalidValue("CGM Sample Location \(typeSampleLocation >> 4)")
-        }
-
-        if flags.contains(.e2eCRC), !data.isCRCValid {
-            throw CGMCodecError.invalidCRC
         }
 
         self.init(flags: flags, type: type, sampleLocation: sampleLocation)

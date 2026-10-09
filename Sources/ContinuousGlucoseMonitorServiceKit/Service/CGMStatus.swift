@@ -28,7 +28,7 @@ public struct CGMStatus: Equatable, Sendable {
     }
 
     public init(data: Data, e2eCRC: Bool) throws {
-        let expected = Self.baseSize + (e2eCRC ? CGMMeasurementRecord.crcSize : 0)
+        let expected = Self.baseSize + (e2eCRC ? CGME2ECRC.size : 0)
         guard data.count == expected else {
             throw CGMCodecError.truncated(expected: expected, actual: data.count)
         }

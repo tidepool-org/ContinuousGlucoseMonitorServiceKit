@@ -29,7 +29,6 @@ public struct CGMMeasurementFlags: OptionSet, Hashable, Sendable {
 public struct CGMMeasurementRecord: Sendable {
     /// Size + Flags + Glucose + Time Offset (CGMS §3.1.1.1).
     public static let minimumSize = 6
-    public static let crcSize = 2
 
     /// mg/dL; NaN when the sensor has no valid result.
     public var glucoseConcentration: Double
@@ -82,7 +81,7 @@ public struct CGMMeasurementRecord: Sendable {
         if let trend { body.appendSFloat(trend) }
         if let quality { body.appendSFloat(quality) }
 
-        let size = 2 + body.count + (e2eCRC ? Self.crcSize : 0)
+        let size = 2 + body.count + (e2eCRC ? CGME2ECRC.size : 0)
         var record = Data([UInt8(size), flags.rawValue])
         record.append(body)
         return e2eCRC ? record.appendingCRC() : record
@@ -110,21 +109,45 @@ public struct CGMMeasurementRecord: Sendable {
         return records
     }
 
+    /// Octets a record occupies before the CRC, as announced by its Flags.
+    static func fieldsSize(for flags: CGMMeasurementFlags) -> Int {
+        var size = minimumSize
+        if flags.contains(.statusOctetPresent) { size += 1 }
+        if flags.contains(.calTempOctetPresent) { size += 1 }
+        if flags.contains(.warningOctetPresent) { size += 1 }
+        if flags.contains(.trendPresent) { size += 2 }
+        if flags.contains(.qualityPresent) { size += 2 }
+        return size
+    }
+
     private static func decodeNext(from reader: inout CGMDataReader, e2eCRC: Bool) throws -> CGMMeasurementRecord {
         let start = reader.offset
         let size = Int(try reader.read(UInt8.self))
-        let crcSize = e2eCRC ? Self.crcSize : 0
+        let crcSize = e2eCRC ? CGME2ECRC.size : 0
 
-        guard size >= minimumSize + crcSize else {
-            if e2eCRC, size >= minimumSize { throw CGMCodecError.missingCRC }
+        guard size >= minimumSize else {
             throw CGMCodecError.invalidSize(UInt8(size))
         }
         guard reader.remaining >= size - 1 else {
             throw CGMCodecError.truncated(expected: size, actual: reader.remaining + 1)
         }
 
-        let rawFlags = try reader.read(UInt8.self)
-        let flags = CGMMeasurementFlags(rawValue: rawFlags)
+        // The Flags announce how many octets the fields take, so the CRC's position is known before parsing:
+        // Size equal to the fields alone means the CRC was never sent (Missing CRC); otherwise the CRC is
+        // verified first, so any corruption (Flags included) is reported as Invalid CRC rather than as a
+        // bad field; an intact record whose Size still disagrees with its Flags is Invalid Size.
+        let flags = CGMMeasurementFlags(rawValue: try reader.read(UInt8.self))
+        let fieldsSize = Self.fieldsSize(for: flags)
+        if e2eCRC {
+            if size == fieldsSize { throw CGMCodecError.missingCRC }
+            guard reader.bytes(from: start, count: size).isCRCValid else {
+                throw CGMCodecError.invalidCRC
+            }
+        }
+        guard size == fieldsSize + crcSize else {
+            throw CGMCodecError.invalidSize(UInt8(size))
+        }
+
         let glucose = try reader.readSFloat()
         let timeOffset = try reader.read(UInt16.self)
 
@@ -140,17 +163,9 @@ public struct CGMMeasurementRecord: Sendable {
         var quality: Double?
         if flags.contains(.qualityPresent) { quality = try reader.readSFloat() }
 
-        // The Size field must account for exactly the fields the Flags announce.
-        guard reader.offset - start == size - crcSize else {
-            throw CGMCodecError.invalidSize(UInt8(size))
-        }
-
         if e2eCRC {
-            let crc = try reader.read(UInt16.self)
-            let protected = reader.bytes(from: start, count: size - crcSize)
-            guard protected.crc16 == crc else {
-                throw CGMCodecError.invalidCRC
-            }
+            // Already verified above; consume the CRC octets.
+            _ = try reader.read(UInt16.self)
         }
 
         return CGMMeasurementRecord(
@@ -168,7 +183,7 @@ extension CGMMeasurementRecord: Equatable {
         lhs.glucoseConcentration.isSameMeasurement(as: rhs.glucoseConcentration)
             && lhs.timeOffset == rhs.timeOffset
             && lhs.sensorStatus == rhs.sensorStatus
-            && lhs.trend == rhs.trend
-            && lhs.quality == rhs.quality
+            && lhs.trend.isSameMeasurement(as: rhs.trend)
+            && lhs.quality.isSameMeasurement(as: rhs.quality)
     }
 }

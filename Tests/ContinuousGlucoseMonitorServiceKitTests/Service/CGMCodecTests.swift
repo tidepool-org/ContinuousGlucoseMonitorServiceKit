@@ -33,42 +33,20 @@ struct CGMCRCTests {
 }
 
 // MARK: - SFLOAT
+// The codec itself is tested in BluetoothCommonKit (SFloatTests); here we only pin the glucose-facing contract.
 
 @Suite("SFLOAT mg/dL")
 struct SFloatTests {
-    @Test(arguments: [
-        (100.0, UInt16(0x0064)),   // 100 e0
-        (120.5, UInt16(0xF4B5)),   // 1205 e-1
-        (-1.25, UInt16(0xEF83)),   // -125 e-2
-        (0.0, UInt16(0x0000)),
-        (95.0, UInt16(0x005F)),
-        (400.0, UInt16(0x0190)),
-    ])
-    func encodesCanonically(value: Double, raw: UInt16) {
-        #expect(SFloat.encode(value) == raw)
-        #expect(SFloat.decode(raw) == value)
-    }
-
-    @Test func specialValues() {
+    /// CGMS values must use the canonical encoding so hand-written spec vectors match byte for byte.
+    @Test func glucoseValuesEncodeCanonically() {
+        #expect(SFloat.encode(100) == 0x0064)
+        #expect(SFloat.encode(120.5) == 0xF4B5)
         #expect(SFloat.encode(.nan) == 0x07FF)
-        #expect(SFloat.encode(.infinity) == 0x07FE)
-        #expect(SFloat.encode(-.infinity) == 0x0802)
-        #expect(SFloat.decode(0x07FF).isNaN)
-        #expect(SFloat.decode(0x0800).isNaN)   // NRes
-        #expect(SFloat.decode(0x0801).isNaN)   // RFU
-        #expect(SFloat.decode(0x07FE) == .infinity)
-        #expect(SFloat.decode(0x0802) == -.infinity)
     }
 
-    @Test func avoidsReservedMantissaAtExponentZero() {
-        let raw = SFloat.encode(2047)
-        #expect(raw != 0x07FF)
-        #expect(abs(SFloat.decode(raw) - 2047) <= 5)
-    }
-
-    @Test func saturatesToInfinity() {
-        #expect(SFloat.encode(1e12) == 0x07FE)
-        #expect(SFloat.encode(-1e12) == 0x0802)
+    @Test func recordWithFractionalTrendComparesEqualAfterRoundTrip() throws {
+        let record = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 1, trend: 0.3)
+        #expect(try CGMMeasurementRecord.decode(record.encoded(e2eCRC: false), e2eCRC: false) == record)
     }
 }
 
@@ -117,6 +95,16 @@ struct CGMMeasurementRecordTests {
         #expect(decoded == record)
     }
 
+    /// 0x07FF in the trend or quality field is a legal "no valid value"; such records must still compare equal.
+    @Test func nanTrendAndQualityRoundTrip() throws {
+        let record = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 1, trend: .nan, quality: .nan)
+        let decoded = try CGMMeasurementRecord.decode(record.encoded(e2eCRC: false), e2eCRC: false)
+        #expect(decoded.trend?.isNaN == true)
+        #expect(decoded.quality?.isNaN == true)
+        #expect(decoded == record)
+        #expect(record != CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 1, trend: nil, quality: .nan))
+    }
+
     @Test func e2eCRCAppendedAndValidated() throws {
         let record = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 5, trend: 0.5)
         let encoded = record.encoded(e2eCRC: true)
@@ -132,10 +120,34 @@ struct CGMMeasurementRecordTests {
         }
     }
 
+    /// A corrupted Flags byte must surface as a CRC failure, not as a size or field error.
+    @Test func corruptedFlagsReportInvalidCRC() {
+        var protected = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 5, trend: 0.5).encoded(e2eCRC: true)
+        protected[1] = 0x00
+        #expect(throws: CGMCodecError.invalidCRC) {
+            try CGMMeasurementRecord.decode(protected, e2eCRC: true)
+        }
+    }
+
+    /// Size equal to what the Flags announce means the CRC was never sent, whatever optional fields are present.
     @Test func missingCRCWhenE2EExpected() {
-        let unprotected = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 5).encoded(e2eCRC: false)
+        let minimal = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 5).encoded(e2eCRC: false)
         #expect(throws: CGMCodecError.missingCRC) {
-            try CGMMeasurementRecord.decode(unprotected, e2eCRC: true)
+            try CGMMeasurementRecord.decode(minimal, e2eCRC: true)
+        }
+        let full = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 5, sensorStatus: .sessionStopped, trend: 1, quality: 90).encoded(e2eCRC: false)
+        #expect(throws: CGMCodecError.missingCRC) {
+            try CGMMeasurementRecord.decode(full, e2eCRC: true)
+        }
+    }
+
+    /// An intact CRC with a Size that still disagrees with the Flags is the sender's bug, not corruption.
+    @Test func validCRCButSizeDisagreesWithFlagsIsInvalidSize() {
+        // Flags 0x00 announce 6 octets of fields, Size claims 7 + CRC.
+        let value = Data([0x09, 0x00, 0x64, 0x00, 0x05, 0x00, 0x00]).appendingCRC()
+        #expect(value.isCRCValid)
+        #expect(throws: CGMCodecError.invalidSize(9)) {
+            try CGMMeasurementRecord.decode(value, e2eCRC: true)
         }
     }
 
@@ -186,6 +198,29 @@ struct CGMFeatureTests {
         #expect(throws: CGMCodecError.invalidCRC) {
             try CGMFeature(data: corrupted)
         }
+
+        // Even when the corruption produces an undefined Type nibble, the CRC failure wins.
+        var corruptedType = encoded
+        corruptedType[3] = 0x50
+        #expect(throws: CGMCodecError.invalidCRC) {
+            try CGMFeature(data: corruptedType)
+        }
+    }
+
+    /// A corruption that clears the E2E bit must not switch the CRC check off for a collector that knows better.
+    @Test func priorE2EKnowledgeForcesCRCCheck() throws {
+        let feature = CGMFeature(flags: [.e2eCRC, .trendInformation])
+        var corrupted = feature.encoded()
+        corrupted[1] &= ~0x10   // clear bit 12 (E2E-CRC) in the flags field
+
+        // Bootstrap read: the payload says "no CRC", the 0xFFFF-less trailer is not inspected, frame accepted.
+        #expect(try CGMFeature(data: corrupted).isE2ECRCSupported == false)
+        // Collector already knows E2E is on: the stale CRC no longer matches, frame rejected.
+        #expect(throws: CGMCodecError.invalidCRC) {
+            try CGMFeature(data: corrupted, e2eCRC: true)
+        }
+        // An intact protected frame passes either way.
+        #expect(try CGMFeature(data: feature.encoded(), e2eCRC: true) == feature)
     }
 
     @Test func rejectsUnknownTypeOrLocation() {
@@ -199,6 +234,17 @@ struct CGMFeatureTests {
 
     @Test func rfuBitsAreMasked() {
         #expect(CGMFeatureFlags(rawValue: 0xFF00_0000).isEmpty)
+    }
+
+    /// Persisted flags must be masked on the way back in, and encode as a plain number.
+    @Test func codableRoundTripMasksRFUBits() throws {
+        let flags = try JSONDecoder().decode(CGMFeatureFlags.self, from: Data("4278190081".utf8))   // 0xFF000001
+        #expect(flags == .calibration)
+        #expect(String(decoding: try JSONEncoder().encode(CGMFeatureFlags([.calibration, .quality])), as: UTF8.self) == "65537")
+
+        let status = try JSONDecoder().decode(CGMSensorStatusAnnunciation.self, from: Data("4278190081".utf8))
+        #expect(status == .sessionStopped)
+        #expect(String(decoding: try JSONEncoder().encode(CGMSensorStatusAnnunciation.sessionStopped), as: UTF8.self) == "1")
     }
 }
 
@@ -263,6 +309,21 @@ struct CGMSessionStartTimeTests {
         #expect(throws: CGMCodecError.truncated(expected: 11, actual: 9)) {
             try CGMSessionStartTime(data: protected.dropLast(2), e2eCRC: true)
         }
+    }
+
+    @Test(arguments: [Int8(57), Int8(-49), Int8(100), Int8(-127)])
+    func rejectsOutOfRangeTimeZone(offset: Int8) {
+        var encoded = CGMSessionStartTime(date: Date(), timeZoneOffset: 0, dstOffset: .standardTime).encoded(e2eCRC: false)
+        encoded[7] = UInt8(bitPattern: offset)
+        #expect(throws: CGMCodecError.invalidValue("Time Zone \(offset)")) {
+            try CGMSessionStartTime(data: encoded, e2eCRC: false)
+        }
+    }
+
+    @Test(arguments: [Int8(56), Int8(-48), CGMSessionStartTime.unknownTimeZone])
+    func acceptsBoundaryTimeZones(offset: Int8) throws {
+        let startTime = CGMSessionStartTime(date: Date(timeIntervalSince1970: 1_790_000_000), timeZoneOffset: offset, dstOffset: .standardTime)
+        #expect(try CGMSessionStartTime(data: startTime.encoded(e2eCRC: false), e2eCRC: false) == startTime)
     }
 
     @Test func rejectsInvalidDSTOffset() {
