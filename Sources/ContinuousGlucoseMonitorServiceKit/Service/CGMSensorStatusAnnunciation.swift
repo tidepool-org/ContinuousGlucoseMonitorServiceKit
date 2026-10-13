@@ -60,4 +60,6 @@ public struct CGMSensorStatusAnnunciation: OptionSet, Hashable, Codable, Sendabl
     public var data: Data {
         Data([statusOctet, calTempOctet, warningOctet])
     }
+
+    // Codable comes from RawRepresentable and decodes through init(rawValue:), so persisted values are masked.
 }

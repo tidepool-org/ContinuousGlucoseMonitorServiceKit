@@ -11,6 +11,11 @@
 import Foundation
 import BluetoothCommonKit
 
+/// E2E-CRC field shared by every protected CGMS characteristic (CGMS §3.11): CRC-CCITT, 2 octets, appended last.
+public enum CGME2ECRC {
+    public static let size = 2
+}
+
 public enum CGMCodecError: Error, Equatable, Sendable {
     case truncated(expected: Int, actual: Int)
     case invalidSize(UInt8)
@@ -63,91 +68,23 @@ public struct CGMDataReader {
     }
 }
 
-/// IEEE 11073-20601 SFLOAT: 4-bit signed exponent (base 10), 12-bit signed mantissa.
-/// Picks the exponent that keeps the most precision, preferring exponent 0 for integral values so that
-/// common glucose values encode canonically (100 mg/dL -> 0x0064).
-public enum SFloat {
-    public static let nan: UInt16 = 0x07FF
-    public static let nRes: UInt16 = 0x0800
-    public static let positiveInfinity: UInt16 = 0x07FE
-    public static let negativeInfinity: UInt16 = 0x0802
-    public static let reservedForFutureUse: UInt16 = 0x0801
-
-    private static let mantissaRange = -2048...2047
-    private static let exponentRange = -8...7
-
-    public static func encode(_ value: Double) -> UInt16 {
-        if value.isNaN { return nan }
-        if value == .infinity { return positiveInfinity }
-        if value == -.infinity { return negativeInfinity }
-
-        var exponent = 0
-        var mantissa = value
-
-        // Gain fractional precision while the mantissa still fits.
-        while exponent > exponentRange.lowerBound,
-              !isIntegral(mantissa),
-              abs(mantissa * 10) <= Double(mantissaRange.upperBound)
-        {
-            mantissa *= 10
-            exponent -= 1
-        }
-
-        // Shed magnitude until the mantissa fits.
-        while exponent < exponentRange.upperBound,
-              !mantissaRange.contains(Int(mantissa.rounded()))
-        {
-            mantissa /= 10
-            exponent += 1
-        }
-
-        var rounded = Int(mantissa.rounded())
-        guard mantissaRange.contains(rounded) else {
-            return value > 0 ? positiveInfinity : negativeInfinity
-        }
-
-        // Exponent 0 with mantissa 0x7FE...0x802 collides with the special values; step up one decade.
-        if exponent == 0, rounded >= 2046 || rounded <= -2046 {
-            rounded = Int((Double(rounded) / 10).rounded())
-            exponent = 1
-        }
-
-        let exponentBits = UInt16(truncatingIfNeeded: exponent) & 0x000F
-        let mantissaBits = UInt16(truncatingIfNeeded: rounded) & 0x0FFF
-        return exponentBits << 12 | mantissaBits
-    }
-
-    public static func decode(_ raw: UInt16) -> Double {
-        switch raw {
-        case nan, nRes, reservedForFutureUse: return .nan
-        case positiveInfinity: return .infinity
-        case negativeInfinity: return -.infinity
-        default: break
-        }
-
-        var exponent = Int(raw >> 12)
-        if exponent >= 8 { exponent -= 16 }
-
-        var mantissa = Int(raw & 0x0FFF)
-        if mantissa >= 2048 { mantissa -= 4096 }
-
-        return Double(mantissa) * pow(10, Double(exponent))
-    }
-
-    private static func isIntegral(_ value: Double) -> Bool {
-        abs(value - value.rounded()) <= 1e-9 * max(1, abs(value))
-    }
-}
-
-public extension Data {
-    mutating func appendSFloat(_ value: Double) {
-        append(SFloat.encode(value))
-    }
-}
+// SFLOAT encode/decode comes from BluetoothCommonKit (`SFloat`, `Data.appendSFloat`), shared with the
+// Insulin Delivery Service kit.
 
 extension Double {
-    /// NaN-aware equality for glucose fields, where NaN means "no valid result" and should compare equal to itself.
+    /// NaN-aware equality for SFLOAT fields, where NaN means "no valid result" and should compare equal to itself.
     func isSameMeasurement(as other: Double) -> Bool {
         (isNaN && other.isNaN) || self == other
+    }
+}
+
+extension Optional where Wrapped == Double {
+    /// NaN-aware equality for optional SFLOAT fields such as trend and quality.
+    func isSameMeasurement(as other: Double?) -> Bool {
+        switch (self, other) {
+        case (nil, nil): return true
+        case let (lhs?, rhs?): return lhs.isSameMeasurement(as: rhs)
+        default: return false
+        }
     }
 }

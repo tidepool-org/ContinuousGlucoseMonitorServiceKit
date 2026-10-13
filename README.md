@@ -4,4 +4,6 @@ ContinuousGlucoseMonitorServiceKit implements the [Bluetooth Continuous Glucose 
 
 `Sources/ContinuousGlucoseMonitorServiceKit/Service` holds the characteristic UUIDs and the wire codecs for every CGMS characteristic (CGM Measurement, Feature, Status, Session Start Time, Session Run Time) plus the Record Access Control Point and CGM Specific Ops Control Point constants. The codecs are shared by a CGM sensor (GATT server) and a collector (GATT client) so both sides encode and decode identically, and can be used to support rapid development and testing of CGM sensors and collectors that also use CGMS.
 
+`Sources/ContinuousGlucoseMonitorServiceKit/Mock` holds `MockCGMSensor`, a complete simulated CGM sensor: it publishes the CGM, Device Information and Battery services on a `GATTServer`, runs a session with a measurement timer, samples a glucose trace (constant, sine wave, or a scripted scenario that steps one value per measurement) and notifies CGM Measurement to a subscribed collector. The scripted scenarios ship with the kit in `Resources/` and load through `CGMScenarioLibrary.bundled`, so any host app drives the mock sensor with the same data.
+
 Depends on [BluetoothCommonKit](https://github.com/tidepool-org/BluetoothCommonKit) for ACS, SFLOAT, E2E-CRC, Date Time helpers and the GATT server / peripheral plumbing.

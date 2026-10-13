@@ -81,4 +81,9 @@ extension CBPeripheral {
 public enum CGMApplicationErrorCode: UInt8, Sendable {
     case missingCRC = 0x80
     case invalidCRC = 0x81
+
+    /// The same value as a CoreBluetooth ATT error, for `CBPeripheralManager.respond(to:withResult:)`.
+    public var attErrorCode: CBATTError.Code {
+        CBATTError.Code(rawValue: Int(rawValue)) ?? .unlikelyError
+    }
 }
