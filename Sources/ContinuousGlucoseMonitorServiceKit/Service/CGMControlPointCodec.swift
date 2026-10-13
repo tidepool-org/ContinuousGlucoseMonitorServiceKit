@@ -373,6 +373,68 @@ public struct CGMRACPRequest: Equatable, Sendable {
     }
 }
 
+/// Why an RACP request was refused; each case maps to a Response Code (CGMS §3.6.3.6, GLS RACP).
+public enum CGMRACPRequestError: Error, Equatable, Sendable {
+    case opCodeNotSupported(UInt8)
+    case invalidOperator(UInt8)
+    /// Filter Type other than Time Offset (CGMS Table 3.5; User Facing Time is not allowed in CGMS).
+    case operandNotSupported(UInt8)
+    case invalidOperand
+}
+
+extension CGMRACPRequest {
+    /// Decodes a client write to the RACP, validating op code, operator and operand shape together.
+    public init(data: Data) throws {
+        guard data.count >= 2 else { throw CGMRACPRequestError.invalidOperand }
+        var reader = CGMDataReader(data)
+        func read<T: FixedWidthInteger>(_ type: T.Type) throws -> T {
+            do { return try reader.read(type) } catch { throw CGMRACPRequestError.invalidOperand }
+        }
+
+        let rawOpcode = try read(UInt8.self)
+        guard let opcode = CGMRACPOpcode(rawValue: rawOpcode), CGMRACPOpcode.requests.contains(opcode) else {
+            throw CGMRACPRequestError.opCodeNotSupported(rawOpcode)
+        }
+        let rawOperator = try read(UInt8.self)
+        guard let racpOperator = CGMRACPOperator(rawValue: rawOperator) else {
+            throw CGMRACPRequestError.invalidOperator(rawOperator)
+        }
+
+        // Abort carries the Null operator and nothing else; every other op code needs a real operator.
+        if opcode == .abortOperation {
+            guard racpOperator == .null else { throw CGMRACPRequestError.invalidOperator(rawOperator) }
+            guard reader.isAtEnd else { throw CGMRACPRequestError.invalidOperand }
+            self = .abort
+            return
+        }
+        guard racpOperator != .null else { throw CGMRACPRequestError.invalidOperator(rawOperator) }
+
+        var minimum: UInt16 = 0
+        var maximum: UInt16 = 0
+        if racpOperator.includesFilter {
+            let rawFilter = try read(UInt8.self)
+            guard CGMRACPFilterType(rawValue: rawFilter) == .timeOffset else {
+                throw CGMRACPRequestError.operandNotSupported(rawFilter)
+            }
+            switch racpOperator {
+            case .lessThanOrEqualTo:
+                maximum = try read(UInt16.self)
+            case .greaterThanOrEqualTo:
+                minimum = try read(UInt16.self)
+            case .withinRangeOf:
+                minimum = try read(UInt16.self)
+                maximum = try read(UInt16.self)
+                guard minimum <= maximum else { throw CGMRACPRequestError.invalidOperand }
+            default:
+                break
+            }
+        }
+        guard reader.isAtEnd else { throw CGMRACPRequestError.invalidOperand }
+
+        self.init(opcode: opcode, racpOperator: racpOperator, filterType: .timeOffset, minimum: minimum, maximum: maximum)
+    }
+}
+
 // MARK: - RACP response
 
 public enum CGMRACPResponse: Equatable, Sendable {

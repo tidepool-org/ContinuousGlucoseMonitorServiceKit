@@ -101,6 +101,27 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// Position in a scripted scenario; advances once per measurement.
     private var scenarioIndex = 0
 
+    // MARK: Record database (CGMS §3.6)
+
+    /// Every measurement of the current session, for RACP reports and backfill after a link loss (HYD-G-015).
+    /// Cleared when a session starts (CGMS §3.4.5). Set `capacity` to change how much history is kept.
+    public var recordStore = CGMRecordStore() {
+        didSet {
+            guard oldValue != recordStore else { return }
+            notifyDelegate()
+        }
+    }
+
+    /// Records packed into one CGM Measurement notification during an RACP report (HYD-G-013). The
+    /// collector's ATT MTU must fit them; iOS negotiates well above the 23-octet default.
+    public var recordsPerNotification = 1 {
+        didSet { recordsPerNotification = max(1, recordsPerNotification) }
+    }
+
+    /// Set when a Report Stored Records transfer was queued; the procedure is in progress until the
+    /// message queue has drained (CGMS §3.6.3.6 Procedure Already In Progress).
+    private var racpReportQueued = false
+
     public private(set) var lastMeasurement: CGMMeasurementRecord?
 
     /// Measurements taken in the current session; lets a tester see activity when the value barely moves.
@@ -254,6 +275,8 @@ public final class MockCGMSensor: @unchecked Sendable {
         lastMeasurement = nil
         measurementCount = 0
         scenarioIndex = 0
+        recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
+        racpReportQueued = false
         sessionState = .running
         ConsoleOut.shared.logMessage(message: "\(#function): session started at \(sessionStartedAt)")
         scheduleMeasurementTimer()
@@ -278,7 +301,50 @@ public final class MockCGMSensor: @unchecked Sendable {
     public func takeMeasurement() -> CGMMeasurementRecord? {
         guard sessionState == .running else { return nil }
 
-        let elapsed = now().timeIntervalSince(sessionStartedAt)
+        let record = makeRecord(elapsed: now().timeIntervalSince(sessionStartedAt), timeOffset: timeOffset)
+        lastMeasurement = record
+        measurementCount += 1
+        ConsoleOut.shared.logMessage(message: "\(#function) #\(measurementCount): \(record)")
+
+        recordStore.append(record)   // also notifies the delegate
+        notifyMeasurements([record])
+        return record
+    }
+
+    /// Fills the database as if the sensor had been running unattended for `duration` (HYD-G-015 test aid):
+    /// the session start moves back by that much, so Time Offset jumps, and one record per measurement
+    /// interval is generated from the glucose source for the gap. Nothing is notified, exactly as when the
+    /// collector is out of range; it learns about the records through RACP. Returns how many were added.
+    @discardableResult
+    public func backfill(duration: TimeInterval) -> Int {
+        guard sessionState == .running, duration > 0 else { return 0 }
+        let count = Int(duration / measurementInterval)
+        guard count > 0 else { return 0 }
+
+        let previousElapsed = now().timeIntervalSince(sessionStartedAt)
+        sessionStartedAt = sessionStartedAt.addingTimeInterval(-duration)
+        if let start = sessionStartTime {
+            // Keep Session Start Time + Time Offset pointing at the same wall-clock instants.
+            sessionStartTime = CGMSessionStartTime(date: start.date.addingTimeInterval(-duration), timeZoneOffset: start.timeZoneOffset, dstOffset: start.dstOffset)
+        }
+
+        // Build in a local copy so observers hear about the batch once, not per record.
+        var store = recordStore
+        for step in 1...count {
+            let elapsed = previousElapsed + Double(step) * measurementInterval
+            let record = makeRecord(elapsed: elapsed, timeOffset: UInt16(clamping: Int(elapsed / 60)))
+            store.append(record)
+            lastMeasurement = record
+        }
+        measurementCount += count
+        recordStore = store
+        ConsoleOut.shared.logMessage(message: "\(#function): \(count) records over \(Int(duration / 60)) min; time offset now \(timeOffset)")
+        return count
+    }
+
+    /// One CGM Measurement from the glucose source at `elapsed` seconds into the session; consumes a
+    /// scenario value when the source is scripted.
+    private func makeRecord(elapsed: TimeInterval, timeOffset: UInt16) -> CGMMeasurementRecord {
         let index = scenarioIndex
         let trend = trace.trend(elapsed: elapsed, index: index)
         let record = CGMMeasurementRecord(
@@ -289,20 +355,24 @@ public final class MockCGMSensor: @unchecked Sendable {
             quality: feature.flags.contains(.quality) ? 100 : nil
         )
         scenarioIndex += 1
-        lastMeasurement = record
-        measurementCount += 1
-        ConsoleOut.shared.logMessage(message: "\(#function) #\(measurementCount): \(record)")
-
-        let encoded = record.encoded(e2eCRC: isE2EProtectionSupported)
-        if isAuthorizationControlEnabled {
-            // Protected resource: encrypted notification on AC Data Out Notify (checks its own subscription).
-            authorizationDataCharacteristic.sendSecureNotification(encoded, to: CGMResourceHandle.handle(for: .measurement))
-        } else if gattServer.isCharacteristicSubscribed(CGMCharacteristicUUID.measurement.cbUUID) == true {
-            messageQueue.addQueueItem(UUIDValuePair(uuid: CGMCharacteristicUUID.measurement.cbUUID, value: encoded))
-        }
-
-        notifyDelegate()
         return record
+    }
+
+    /// One CGM Measurement notification carrying `records` back to back (CGMS §3.1: a value may hold
+    /// several records). Plain path only when the collector subscribed; the secure path checks AC Data Out.
+    private func notifyMeasurements(_ records: [CGMMeasurementRecord]) {
+        let value = records.reduce(into: Data()) { $0.append($1.encoded(e2eCRC: isE2EProtectionSupported)) }
+        if isAuthorizationControlEnabled {
+            authorizationDataCharacteristic.sendSecureNotification(value, to: CGMResourceHandle.handle(for: .measurement))
+        } else if gattServer.isCharacteristicSubscribed(CGMCharacteristicUUID.measurement.cbUUID) == true {
+            messageQueue.addQueueItem(UUIDValuePair(uuid: CGMCharacteristicUUID.measurement.cbUUID, value: value))
+        }
+    }
+
+    /// Whether record notifications can reach the collector on the active channel (CGMS §3.6.3.6).
+    private var isMeasurementNotificationConfigured: Bool {
+        let uuid = isAuthorizationControlEnabled ? ACCharacteristicUUID.dataOutNotify.cbUUID : CGMCharacteristicUUID.measurement.cbUUID
+        return gattServer.isCharacteristicSubscribed(uuid) == true
     }
 
     private func scheduleMeasurementTimer() {
@@ -382,20 +452,75 @@ public final class MockCGMSensor: @unchecked Sendable {
         return .success
     }
 
-    /// Phase 1: every RACP op code is answered with Response Code / Op Code not supported (CGMS §3.8.2).
-    /// RACP never carries an E2E-CRC (CGMS §3.6).
+    /// Record Access Control Point (CGMS §3.6): Report Number / Report / Delete Stored Records with the
+    /// Time Offset filter, and Abort. Records go out as CGM Measurement notifications followed by a
+    /// Response Code indication; the message queue preserves that order. RACP never carries an E2E-CRC.
     public func writeRecordAccessControlPoint(_ data: Data?) -> CBATTError.Code {
         guard let data, let requestOpcode = data.first else { return .invalidPdu }
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString)")
 
-        let response = Data([
-            CGMRACPOpcode.responseCode.rawValue,
-            CGMRACPOperator.null.rawValue,
-            requestOpcode,
-            CGMRACPResponseCode.opCodeNotSupported.rawValue
-        ])
-        indicate(response, on: .recordAccessControlPoint)
+        let request: CGMRACPRequest
+        do {
+            request = try CGMRACPRequest(data: data)
+        } catch let error as CGMRACPRequestError {
+            switch error {
+            case .opCodeNotSupported: respondRACP(requestOpcode, .opCodeNotSupported)
+            case .invalidOperator: respondRACP(requestOpcode, .invalidOperator)
+            case .operandNotSupported: respondRACP(requestOpcode, .operandNotSupported)
+            case .invalidOperand: respondRACP(requestOpcode, .invalidOperand)
+            }
+            return .success
+        } catch {
+            return .invalidPdu
+        }
+
+        if request.opcode == .abortOperation {
+            // Best effort (CGMS §3.6.3.5): drop whatever is still waiting to be sent.
+            messageQueue.emptyQueue()
+            racpReportQueued = false
+            respondRACP(.abortOperation, .success)
+            return .success
+        }
+
+        // CGMS §3.6.3.6: one procedure at a time, and record notifications need their CCCD configured.
+        if racpReportQueued, messageQueue.hasMessagesInQueue {
+            return .procedureAlreadyInProgress
+        }
+        racpReportQueued = false
+        if request.opcode == .reportStoredRecords, !isMeasurementNotificationConfigured {
+            return .improperlyConfigured
+        }
+
+        let selected = recordStore.select(request.racpOperator, minimum: request.minimum, maximum: request.maximum)
+        switch request.opcode {
+        case .reportNumberOfStoredRecords:
+            let response = CGMRACPResponse.numberOfStoredRecords(UInt16(clamping: selected.count))
+            indicate(response.encoded(), on: .recordAccessControlPoint)
+        case .reportStoredRecords:
+            guard !selected.isEmpty else {
+                respondRACP(.reportStoredRecords, .noRecordsFound)
+                break
+            }
+            for chunk in selected.chunked(by: recordsPerNotification) {
+                notifyMeasurements(chunk)
+            }
+            racpReportQueued = true
+            respondRACP(.reportStoredRecords, .success)
+        case .deleteStoredRecords:
+            let deleted = recordStore.delete(request.racpOperator, minimum: request.minimum, maximum: request.maximum)
+            respondRACP(.deleteStoredRecords, deleted > 0 ? .success : .noRecordsFound)
+        case .abortOperation, .numberOfStoredRecordsResponse, .responseCode:
+            break
+        }
         return .success
+    }
+
+    private func respondRACP(_ request: CGMRACPOpcode, _ code: CGMRACPResponseCode) {
+        respondRACP(request.rawValue, code)
+    }
+
+    private func respondRACP(_ request: UInt8, _ code: CGMRACPResponseCode) {
+        indicate(CGMRACPResponse.responseCode(request: request, code: code.rawValue).encoded(), on: .recordAccessControlPoint)
     }
 
     /// Start Session and Stop Session are implemented (CGMS §3.7.2.8, §3.7.2.9); every other op code is
