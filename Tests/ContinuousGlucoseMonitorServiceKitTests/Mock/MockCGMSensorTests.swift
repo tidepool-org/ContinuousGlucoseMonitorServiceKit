@@ -36,12 +36,13 @@ struct MockCGMSensorTests {
 
     // MARK: - GATT layout
 
-    @Test func publishesCGMDeviceInformationAndBatteryServices() {
+    @Test func publishesCGMDeviceInformationBatteryAndAuthorizationServices() {
         let uuids = server.services.map(\.uuid)
         #expect(uuids == [
             CGMCharacteristicUUID.service.cbUUID,
             DeviceInfoCharacteristicUUID.service.cbUUID,
-            BatteryCharacteristicUUID.service.cbUUID
+            BatteryCharacteristicUUID.service.cbUUID,
+            ACCharacteristicUUID.service.cbUUID
         ])
         #expect(server.services.allSatisfy { $0.primary })
         #expect(server.addServiceCount == 1)
