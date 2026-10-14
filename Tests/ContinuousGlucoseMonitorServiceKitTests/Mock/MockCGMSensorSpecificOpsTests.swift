@@ -141,28 +141,60 @@ struct MockCGMSensorSpecificOpsTests {
         #expect(sensor.communicationInterval == 1)
     }
 
-    @Test func disabledIntervalStopsPeriodicReadingsAndNotifications() throws {
+    /// §3.7.2.1 disables communication, not measurement: readings keep being stored for RACP.
+    @Test func disabledIntervalKeepsMeasuringButStopsNotifying() throws {
         server.subscribed.insert(measurement)
         sensor.trace = .constant(mgdl: 100)
         sensor.startSession()
-        #expect(sensor.nextMeasurementDate != nil)
 
         #expect(try send(CGMSpecificOpsRequest.setCommunicationInterval(minutes: 0, e2eCRC: false)) == .responseCode(request: 0x01, code: 0x01))
         #expect(!sensor.isPeriodicCommunicationEnabled)
-        #expect(sensor.nextMeasurementDate == nil)   // timer stopped
+        #expect(sensor.nextMeasurementDate != nil)   // timer still running
         #expect(try send(request(.getCommunicationInterval)) == .communicationInterval(minutes: 0))
 
-        // Measure Now still stores a reading for RACP, silently.
         _ = sensor.takeMeasurement()
         #expect(measurementValues().isEmpty)
         #expect(sensor.recordStore.count == 1)
 
-        // Turning it back on resumes the timer at the previous cadence.
+        // A session started while off still measures (and the Off setting survives the restart).
+        sensor.startSession()
+        #expect(sensor.nextMeasurementDate != nil)
+        #expect(!sensor.isPeriodicCommunicationEnabled)
+
+        // Turning it back on notifies again at the previous cadence.
         _ = try send(CGMSpecificOpsRequest.setCommunicationInterval(minutes: 5, e2eCRC: false))
         #expect(sensor.isPeriodicCommunicationEnabled)
-        #expect(sensor.nextMeasurementDate != nil)
+        #expect(sensor.measurementInterval == 300)
         _ = sensor.takeMeasurement()
         #expect(measurementValues().count == 1)
+    }
+
+    final class DelegateSpy: MockCGMSensorDelegate {
+        var updates = 0
+        func mockSensorDidUpdate(_ sensor: MockCGMSensor) { updates += 1 }
+    }
+
+    /// One CGMCP write or one Start Session is one consistent update to observers, not several partial ones.
+    @Test func compoundChangesNotifyTheDelegateOnce() {
+        let spy = DelegateSpy()
+        sensor.delegate = spy
+        sensor.setCommunicationInterval(10)
+        #expect(spy.updates == 1)
+        sensor.startSession()
+        #expect(spy.updates == 2)
+    }
+
+    /// A backfilled record carries the calibration bits of its own Time Offset, not of the clock at backfill.
+    @Test func backfilledRecordsCarryTheirOwnCalibrationStatus() {
+        sensor.trace = .constant(mgdl: 100)
+        sensor.startSession()
+        #expect(sensor.backfill(duration: 8 * 3600) == 96)   // 5 min cadence, Once schedule
+        let records = sensor.recordStore.records
+        #expect(records.first?.sensorStatus.contains(.calibrationRecommended) == true)   // offset 5
+        #expect(records.first?.sensorStatus.contains(.calibrationRequired) == false)
+        #expect(records.last?.sensorStatus.contains(.calibrationRequired) == true)       // offset 480 ≥ 180
+        #expect(records[34].sensorStatus.contains(.calibrationRecommended) == true)      // offset 175
+        #expect(records[35].sensorStatus.contains(.calibrationRequired) == true)         // offset 180: the boundary
     }
 
     // MARK: Calibration
@@ -366,10 +398,16 @@ struct MockCGMSensorSpecificOpsTests {
         let notified = try CGMMeasurementRecord.decode(try #require(measurementValues().first), e2eCRC: false)
         #expect(notified.sensorStatus.contains(.resultHigherThanPatientHigh))
 
+        // Switching the family off in the Feature clears its bit at once, before the next reading.
+        sensor.feature.flags.remove(.hyperAlerts)
+        #expect(!sensor.sensorStatus.contains(.resultHigherThanHyper))
+        #expect(sensor.sensorStatus.contains(.resultHigherThanPatientHigh))
+
         // Back in range: the bits clear on the next reading.
         sensor.trace = .constant(mgdl: 120)
         _ = sensor.takeMeasurement()
-        #expect(sensor.sensorStatus.isDisjoint(with: CGMAlertLevels.annunciationBits))
+        #expect(!sensor.sensorStatus.contains(.resultHigherThanPatientHigh))
+        #expect(sensor.alertStatus == [])
     }
 
     // MARK: Device specific alert

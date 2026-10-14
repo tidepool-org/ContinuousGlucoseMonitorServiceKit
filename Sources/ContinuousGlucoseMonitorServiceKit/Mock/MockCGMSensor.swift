@@ -38,6 +38,8 @@ public final class MockCGMSensor: @unchecked Sendable {
     public var feature: CGMFeature {
         didSet {
             guard oldValue != feature else { return }
+            // An alert family switched off must leave Status at once, not at the next reading.
+            refreshAlertStatus()
             indicateFeatureIfSubscribed()
             notifyDelegate()
         }
@@ -129,11 +131,11 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// Measurement and communication cadence are one setting (Nate, 2026-10-14): every reading is notified
     /// as it is taken, and the CGMCP Communication Interval changes `measurementInterval`. Off (operand 0x00)
-    /// stops the periodic readings and their notifications; a tester's Measure Now still stores a reading.
+    /// disables the notifications only (§3.7.2.1): the sensor keeps measuring at the current cadence and
+    /// stores the readings for RACP, as a real sensor does while the collector is away.
     public var isPeriodicCommunicationEnabled = true {
         didSet {
             guard oldValue != isPeriodicCommunicationEnabled else { return }
-            scheduleMeasurementTimer()
             notifyDelegate()
         }
     }
@@ -145,17 +147,19 @@ public final class MockCGMSensor: @unchecked Sendable {
         return UInt8(clamping: Int(measurementInterval / 60))
     }
 
-    /// Applies a Set CGM Communication Interval operand (§3.7.2.1).
+    /// Applies a Set CGM Communication Interval operand (§3.7.2.1). Observers hear one consistent update.
     public func setCommunicationInterval(_ minutes: UInt8) {
-        switch minutes {
-        case CGMCommunicationInterval.periodicDisabled:
-            isPeriodicCommunicationEnabled = false
-        case CGMCommunicationInterval.fastestSupported:
-            measurementInterval = Self.fastestMeasurementInterval
-            isPeriodicCommunicationEnabled = true
-        default:
-            measurementInterval = TimeInterval(minutes) * 60
-            isPeriodicCommunicationEnabled = true
+        batchingDelegateUpdates {
+            switch minutes {
+            case CGMCommunicationInterval.periodicDisabled:
+                isPeriodicCommunicationEnabled = false
+            case CGMCommunicationInterval.fastestSupported:
+                measurementInterval = Self.fastestMeasurementInterval
+                isPeriodicCommunicationEnabled = true
+            default:
+                measurementInterval = TimeInterval(minutes) * 60
+                isPeriodicCommunicationEnabled = true
+            }
         }
     }
 
@@ -193,24 +197,29 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// Required (Nate, 2026-10-14: 3 h). Periodic schedules use their own interval instead.
     public var calibrationRequiredAfterMinutes: UInt16 = 180
 
-    /// Calibration Recommended or Required, derived from the schedule and the last stored calibration's Next
-    /// Calibration Time against the current Time Offset. Clock-driven, so Status and each record pick it up
-    /// without a timer. With nothing stored yet (fresh launch, new session) the schedule's initial status
-    /// applies (recommended for most; revisit if QA or design object). Nothing when the Feature says
-    /// calibration is unsupported.
+    /// Calibration Recommended or Required right now, derived from the schedule and the last stored
+    /// calibration's Next Calibration Time against the current Time Offset. Clock-driven, so Status and each
+    /// record pick it up without a timer.
     public var calibrationStatus: CGMSensorStatusAnnunciation {
+        calibrationStatus(at: timeOffset)
+    }
+
+    /// The calibration bits that apply at `offset` minutes into the session, so a backfilled record carries
+    /// the status of its own moment rather than of the clock. With nothing stored yet (fresh launch, new
+    /// session) the schedule's initial status applies (recommended for most; revisit if QA or design object).
+    /// Nothing when the Feature says calibration is unsupported.
+    public func calibrationStatus(at offset: UInt16) -> CGMSensorStatusAnnunciation {
         guard feature.flags.contains(.calibration) else { return [] }
         guard let next = calibrationStore.last?.nextCalibrationTime else {
             // A recommendation ignored past the schedule's first due time becomes a requirement.
-            if let due = calibrationSchedule.firstCalibrationRequiredAfter(graceMinutes: calibrationRequiredAfterMinutes), timeOffset >= due {
+            if let due = calibrationSchedule.firstCalibrationRequiredAfter(graceMinutes: calibrationRequiredAfterMinutes), offset >= due {
                 return .calibrationRequired
             }
             return calibrationSchedule.initialStatus
         }
         guard next != CGMCalibrationSchedule.noFurtherCalibration else { return [] }
-        let offset = Int(timeOffset)
-        if offset >= Int(next) { return .calibrationRequired }
-        if offset >= Int(next) - Int(calibrationSchedule.recommendedLead(calibrationRecommendedLeadMinutes)) { return .calibrationRecommended }
+        if Int(offset) >= Int(next) { return .calibrationRequired }
+        if Int(offset) >= Int(next) - Int(calibrationSchedule.recommendedLead(calibrationRecommendedLeadMinutes)) { return .calibrationRecommended }
         return []
     }
 
@@ -344,8 +353,14 @@ public final class MockCGMSensor: @unchecked Sendable {
     }
 
     public var sensorStatus: CGMSensorStatusAnnunciation {
+        sensorStatus(at: timeOffset)
+    }
+
+    /// Status as of `offset` minutes into the session: the tester's bits, the alert bits of the latest
+    /// reading, and the calibration bits that applied at that moment.
+    private func sensorStatus(at offset: UInt16) -> CGMSensorStatusAnnunciation {
         // Time Synchronization Required is tester-controlled: the sensor knows its own start time.
-        var status = manualSensorStatus.union(alertStatus).union(calibrationStatus)
+        var status = manualSensorStatus.union(alertStatus).union(calibrationStatus(at: offset))
         if sessionState != .running { status.insert(.sessionStopped) }
         return status
     }
@@ -363,21 +378,22 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// Starts a new session: Time Offset restarts at 0 and Session Start Time is taken from the device clock.
     public func startSession() {
-        sessionStartedAt = now()
-        sessionStoppedAt = nil
-        sessionStartTime = CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
-        sessionStartTimeSetByCollector = false
-        lastMeasurement = nil
-        measurementCount = 0
-        scenarioIndex = 0
-        recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
-        racpReportQueued = false
-        calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
-        alertStatus = []
-        sessionState = .running
-        ConsoleOut.shared.logMessage(message: "\(#function): session started at \(sessionStartedAt)")
-        scheduleMeasurementTimer()
-        notifyDelegate()
+        batchingDelegateUpdates {
+            sessionStartedAt = now()
+            sessionStoppedAt = nil
+            sessionStartTime = CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
+            sessionStartTimeSetByCollector = false
+            lastMeasurement = nil
+            measurementCount = 0
+            scenarioIndex = 0
+            recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
+            racpReportQueued = false
+            calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
+            alertStatus = []
+            sessionState = .running
+            ConsoleOut.shared.logMessage(message: "\(#function): session started at \(sessionStartedAt)")
+            scheduleMeasurementTimer()
+        }
     }
 
     public func stopSession() {
@@ -461,7 +477,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         let record = CGMMeasurementRecord(
             glucoseConcentration: glucose,
             timeOffset: timeOffset,
-            sensorStatus: sensorStatus,
+            sensorStatus: sensorStatus(at: timeOffset),   // a backfilled record carries its own moment's bits
             trend: trend,
             quality: feature.flags.contains(.quality) ? 100 : nil
         )
@@ -489,7 +505,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     private func scheduleMeasurementTimer() {
         measurementTimer?.invalidate()
         measurementTimer = nil
-        guard sessionState == .running, isPeriodicCommunicationEnabled else { return }
+        guard sessionState == .running else { return }
         let timer = Timer(timeInterval: measurementInterval, repeats: true) { [weak self] _ in
             self?.takeMeasurement()
         }
@@ -795,7 +811,19 @@ public final class MockCGMSensor: @unchecked Sendable {
     }
 
     func notifyDelegate() {
+        guard !isBatchingDelegateUpdates else { return }
         delegate?.mockSensorDidUpdate(self)
+    }
+
+    private var isBatchingDelegateUpdates = false
+
+    /// Runs `changes`, which may touch several observed properties, and tells the delegate once at the end
+    /// so it never sees a half-applied state.
+    private func batchingDelegateUpdates(_ changes: () -> Void) {
+        isBatchingDelegateUpdates = true
+        changes()
+        isBatchingDelegateUpdates = false
+        notifyDelegate()
     }
 
     private var readPermissions: CBAttributePermissions {
