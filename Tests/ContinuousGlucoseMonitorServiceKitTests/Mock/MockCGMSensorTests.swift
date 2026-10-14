@@ -473,11 +473,11 @@ struct MockCGMSensorTests {
         #expect(sensor.measurementInterval == 60)
     }
 
-    @Test func racpAnswersOpCodeNotSupportedWithNullOperator() {
+    @Test func racpReportsZeroStoredRecordsOnAnEmptyDatabase() {
         let request = Data([CGMRACPOpcode.reportNumberOfStoredRecords.rawValue, CGMRACPOperator.allRecords.rawValue])
         #expect(sensor.writeRecordAccessControlPoint(request) == .success)
         #expect(queue.items[0].uuid == CGMCharacteristicUUID.recordAccessControlPoint.cbUUID)
-        #expect(queue.items[0].value == Data([0x06, 0x00, 0x04, 0x02]))
+        #expect(queue.items[0].value == Data([0x05, 0x00, 0x00, 0x00]))
     }
 
     // MARK: - Feature changes
