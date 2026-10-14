@@ -45,7 +45,11 @@ final class MockGATTService: GATTService {
     }
 
     func characteristic(_ uuid: CGMCharacteristicUUID) -> CallbackCharacteristic? {
-        services.flatMap(\.characteristics).first { $0.uuid == uuid.cbUUID }
+        characteristic(uuid.cbUUID)
+    }
+
+    func characteristic(_ uuid: CBUUID) -> CallbackCharacteristic? {
+        services.flatMap(\.characteristics).first { $0.uuid == uuid }
     }
 }
 
@@ -66,5 +70,10 @@ final class MockMessageQueue: MessagingQueue {
 
     func emptyQueue() {
         items.removeAll()
+    }
+
+    /// Drops only the items for one characteristic, leaving the rest for later assertions.
+    func removeItems(for uuid: CBUUID) {
+        items.removeAll { $0.uuid == uuid }
     }
 }
