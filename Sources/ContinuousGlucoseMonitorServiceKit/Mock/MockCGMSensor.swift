@@ -8,9 +8,9 @@
 //  Simulated CGM sensor. Owns the sensor state and wires it to a
 //  GATT server: CGM Service (CGMS v1.0.2 Table 3.1), Device Information and Battery.
 //
-//  Scope so far: static GATT (Feature, Status, Session Start Time and Session Run Time readable, Session Start
-//  Time writable, both control points answer "Op Code not supported") plus periodic measurements from a
-//  glucose trace, notified on CGM Measurement. RACP and CGMCP procedures arrive in later phases.
+//  Scope so far: the full CGMS GATT layout, periodic measurements from a glucose trace notified at the CGM
+//  Communication Interval, a record database served through the RACP, and every CGMCP procedure of Table 3.6
+//  (communication interval, calibration, alert levels, device specific alert reset, session start/stop).
 //
 //  Threading: CBPeripheralManager is created with a nil queue, so every GATT callback runs on the main
 //  queue, and the UI drives the sensor from the main queue too. `@unchecked Sendable` records that contract.
@@ -121,6 +121,101 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// Set when a Report Stored Records transfer was queued; the procedure is in progress until the
     /// message queue has drained (CGMS §3.6.3.6 Procedure Already In Progress).
     private var racpReportQueued = false
+
+    // MARK: CGM Specific Ops settings (CGMS §3.7)
+
+    /// Fastest cadence the sensor offers; Set CGM Communication Interval 0xFF selects it (§3.7.2.1).
+    public static let fastestMeasurementInterval: TimeInterval = 5
+
+    /// Measurement and communication cadence are one setting (Nate, 2026-10-14): every reading is notified
+    /// as it is taken, and the CGMCP Communication Interval changes `measurementInterval`. Off (operand 0x00)
+    /// stops the periodic readings and their notifications; a tester's Measure Now still stores a reading.
+    public var isPeriodicCommunicationEnabled = true {
+        didSet {
+            guard oldValue != isPeriodicCommunicationEnabled else { return }
+            scheduleMeasurementTimer()
+            notifyDelegate()
+        }
+    }
+
+    /// What Get CGM Communication Interval answers: 0x00 while off, 0xFF below one minute, else whole minutes.
+    public var communicationInterval: UInt8 {
+        guard isPeriodicCommunicationEnabled else { return CGMCommunicationInterval.periodicDisabled }
+        guard measurementInterval >= 60 else { return CGMCommunicationInterval.fastestSupported }
+        return UInt8(clamping: Int(measurementInterval / 60))
+    }
+
+    /// Applies a Set CGM Communication Interval operand (§3.7.2.1).
+    public func setCommunicationInterval(_ minutes: UInt8) {
+        switch minutes {
+        case CGMCommunicationInterval.periodicDisabled:
+            isPeriodicCommunicationEnabled = false
+        case CGMCommunicationInterval.fastestSupported:
+            measurementInterval = Self.fastestMeasurementInterval
+            isPeriodicCommunicationEnabled = true
+        default:
+            measurementInterval = TimeInterval(minutes) * 60
+            isPeriodicCommunicationEnabled = true
+        }
+    }
+
+    /// Thresholds set through the CGMCP; every reading is compared against them (§3.7.2.3–3.7.2.6).
+    public var alertLevels = CGMAlertLevels() {
+        didSet {
+            guard oldValue != alertLevels else { return }
+            refreshAlertStatus()
+            notifyDelegate()
+        }
+    }
+
+    /// Calibration Data Records stored by Set Glucose Calibration Value; cleared when a session starts.
+    public var calibrationStore = CGMCalibrationStore() {
+        didSet {
+            guard oldValue != calibrationStore else { return }
+            notifyDelegate()
+        }
+    }
+
+    /// How often the sensor asks for calibration; written into each stored record's Next Calibration Time
+    /// (§3.7.2.2). Once per session by default (Nate, 2026-10-14).
+    public var calibrationSchedule: CGMCalibrationSchedule = .oncePerSession {
+        didSet {
+            guard oldValue != calibrationSchedule else { return }
+            notifyDelegate()
+        }
+    }
+
+    /// Minutes before Next Calibration Time at which Calibration Recommended is raised (Nate, 2026-10-14:
+    /// 20 min ahead). Calibration Required follows once the time itself has passed.
+    public var calibrationRecommendedLeadMinutes: UInt16 = 20
+
+    /// Session minutes a once-per-session recommendation may go unanswered before it becomes Calibration
+    /// Required (Nate, 2026-10-14: 3 h). Periodic schedules use their own interval instead.
+    public var calibrationRequiredAfterMinutes: UInt16 = 180
+
+    /// Calibration Recommended or Required, derived from the schedule and the last stored calibration's Next
+    /// Calibration Time against the current Time Offset. Clock-driven, so Status and each record pick it up
+    /// without a timer. With nothing stored yet (fresh launch, new session) the schedule's initial status
+    /// applies (recommended for most; revisit if QA or design object). Nothing when the Feature says
+    /// calibration is unsupported.
+    public var calibrationStatus: CGMSensorStatusAnnunciation {
+        guard feature.flags.contains(.calibration) else { return [] }
+        guard let next = calibrationStore.last?.nextCalibrationTime else {
+            // A recommendation ignored past the schedule's first due time becomes a requirement.
+            if let due = calibrationSchedule.firstCalibrationRequiredAfter(graceMinutes: calibrationRequiredAfterMinutes), timeOffset >= due {
+                return .calibrationRequired
+            }
+            return calibrationSchedule.initialStatus
+        }
+        guard next != CGMCalibrationSchedule.noFurtherCalibration else { return [] }
+        let offset = Int(timeOffset)
+        if offset >= Int(next) { return .calibrationRequired }
+        if offset >= Int(next) - Int(calibrationSchedule.recommendedLead(calibrationRecommendedLeadMinutes)) { return .calibrationRecommended }
+        return []
+    }
+
+    /// Annunciation bits the latest reading tripped against `alertLevels`; recomputed on every measurement.
+    public private(set) var alertStatus: CGMSensorStatusAnnunciation = []
 
     public private(set) var lastMeasurement: CGMMeasurementRecord?
 
@@ -250,7 +345,7 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     public var sensorStatus: CGMSensorStatusAnnunciation {
         // Time Synchronization Required is tester-controlled: the sensor knows its own start time.
-        var status = manualSensorStatus
+        var status = manualSensorStatus.union(alertStatus).union(calibrationStatus)
         if sessionState != .running { status.insert(.sessionStopped) }
         return status
     }
@@ -277,6 +372,8 @@ public final class MockCGMSensor: @unchecked Sendable {
         scenarioIndex = 0
         recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
         racpReportQueued = false
+        calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
+        alertStatus = []
         sessionState = .running
         ConsoleOut.shared.logMessage(message: "\(#function): session started at \(sessionStartedAt)")
         scheduleMeasurementTimer()
@@ -307,8 +404,19 @@ public final class MockCGMSensor: @unchecked Sendable {
         ConsoleOut.shared.logMessage(message: "\(#function) #\(measurementCount): \(record)")
 
         recordStore.append(record)   // also notifies the delegate
-        notifyMeasurements([record])
+        // §3.7.2.1: with periodic communication off the reading is stored for RACP only.
+        if isPeriodicCommunicationEnabled { notifyMeasurements([record]) }
         return record
+    }
+
+    /// Re-evaluates the latest reading when the levels change, so Status reflects the new thresholds
+    /// before the next measurement.
+    private func refreshAlertStatus() {
+        guard let last = lastMeasurement else {
+            alertStatus = []
+            return
+        }
+        alertStatus = alertLevels.annunciation(glucose: last.glucoseConcentration, trend: last.trend, feature: feature.flags)
     }
 
     /// Fills the database as if the sensor had been running unattended for `duration` (HYD-G-015 test aid):
@@ -346,12 +454,15 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// scenario value when the source is scripted.
     private func makeRecord(elapsed: TimeInterval, timeOffset: UInt16) -> CGMMeasurementRecord {
         let index = scenarioIndex
-        let trend = trace.trend(elapsed: elapsed, index: index)
+        let glucose = trace.glucose(elapsed: elapsed, index: index).rounded()
+        let trend = feature.flags.contains(.trendInformation) ? (trace.trend(elapsed: elapsed, index: index) * 10).rounded() / 10 : nil
+        // §3.7.2.3–3.7.2.6: the reading is compared against the alert levels and the record carries the result.
+        alertStatus = alertLevels.annunciation(glucose: glucose, trend: trend, feature: feature.flags)
         let record = CGMMeasurementRecord(
-            glucoseConcentration: trace.glucose(elapsed: elapsed, index: index).rounded(),
+            glucoseConcentration: glucose,
             timeOffset: timeOffset,
             sensorStatus: sensorStatus,
-            trend: feature.flags.contains(.trendInformation) ? (trend * 10).rounded() / 10 : nil,
+            trend: trend,
             quality: feature.flags.contains(.quality) ? 100 : nil
         )
         scenarioIndex += 1
@@ -378,7 +489,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     private func scheduleMeasurementTimer() {
         measurementTimer?.invalidate()
         measurementTimer = nil
-        guard sessionState == .running else { return }
+        guard sessionState == .running, isPeriodicCommunicationEnabled else { return }
         let timer = Timer(timeInterval: measurementInterval, repeats: true) { [weak self] _ in
             self?.takeMeasurement()
         }
@@ -523,8 +634,9 @@ public final class MockCGMSensor: @unchecked Sendable {
         indicate(CGMRACPResponse.responseCode(request: request, code: code.rawValue).encoded(), on: .recordAccessControlPoint)
     }
 
-    /// Start Session and Stop Session are implemented (CGMS §3.7.2.8, §3.7.2.9); every other op code is
-    /// answered with Response Code / Op Code not supported (CGMS §3.8.2) until its phase lands.
+    /// CGM Specific Ops Control Point (CGMS §3.7, Table 3.6). Op codes whose alert family or calibration the
+    /// Feature does not advertise are excluded (C.1–C.9) and answer Op Code not supported; levels outside the
+    /// sensor's range and calibration records it no longer holds answer Parameter out of range.
     ///
     /// Operand size is checked first, since the CRC can only be located once the operand length is known:
     /// wrong size → Invalid Operand response; right size without a CRC → Missing CRC; right size with a bad
@@ -548,29 +660,93 @@ public final class MockCGMSensor: @unchecked Sendable {
         case .ok: break
         }
 
+        if let required = opcode.requiredFeature, !feature.flags.contains(required) {
+            indicateSpecificOpsResponse(request: requestOpcode, code: .opCodeNotSupported)
+            return .success
+        }
+
+        // Size and CRC are verified, so the operand is exactly `encodedSize` octets after the op code.
+        var reader = CGMDataReader(data.dropFirst().prefix(operand.encodedSize))
         let responseCode: CGMSpecificOpsResponseCode
-        switch opcode {
-        case .startSession:
-            // Also restarts a running session: previous data is discarded (§3.7.2.8).
-            startSession()
-            responseCode = .success
-        case .stopSession:
-            if sessionState == .running {
-                stopSession()
+        do {
+            switch opcode {
+            case .setCommunicationInterval:
+                setCommunicationInterval(try reader.read(UInt8.self))
                 responseCode = .success
-            } else {
-                // §3.7.2.9: stopping a session that is not running is Op Code not supported.
-                responseCode = .opCodeNotSupported
+            case .getCommunicationInterval:
+                indicateSpecificOps(.communicationInterval(minutes: communicationInterval))
+                return .success
+
+            case .setGlucoseCalibrationValue:
+                let submitted = try CGMCalibrationRecord(data: Data(try reader.readBytes(CGMCalibrationRecord.encodedSize)))
+                guard CGMAlertLevels.glucoseRange.contains(submitted.glucoseConcentration) else {
+                    responseCode = .parameterOutOfRange
+                    break
+                }
+                let stored = calibrationStore.store(submitted, nextCalibrationTime: calibrationSchedule.nextCalibrationTime(after: submitted.calibrationTime))
+                // The request for calibration (tester toggles) is satisfied by this calibration.
+                manualSensorStatus.subtract([.calibrationRequired, .calibrationRecommended])
+                ConsoleOut.shared.logMessage(message: "\(#function): stored calibration \(stored)")
+                responseCode = .success
+            case .getGlucoseCalibrationValue:
+                let number = try reader.read(UInt16.self)
+                guard let record = calibrationStore.record(number: number) else {
+                    // §3.7.2.2: a record the sensor no longer holds.
+                    responseCode = .parameterOutOfRange
+                    break
+                }
+                indicateSpecificOps(.calibrationValue(record))
+                return .success
+
+            case .setPatientHighAlertLevel, .setPatientLowAlertLevel, .setHypoAlertLevel, .setHyperAlertLevel,
+                 .setRateOfDecreaseAlertLevel, .setRateOfIncreaseAlertLevel:
+                let value = try reader.readSFloat()
+                guard CGMAlertLevels.isInRange(value, for: opcode) else {
+                    responseCode = .parameterOutOfRange
+                    break
+                }
+                alertLevels[keyPath: opcode.alertLevelKeyPath!] = value
+                responseCode = .success
+            case .getPatientHighAlertLevel, .getPatientLowAlertLevel, .getHypoAlertLevel, .getHyperAlertLevel,
+                 .getRateOfDecreaseAlertLevel, .getRateOfIncreaseAlertLevel:
+                indicateSpecificOps(.level(opcode: opcode.levelResponseOpcode!, value: alertLevels[keyPath: opcode.alertLevelKeyPath!]))
+                return .success
+
+            case .resetDeviceSpecificAlert:
+                // §3.7.2.7: clears the bit in Status and in subsequent measurement records.
+                manualSensorStatus.remove(.deviceSpecificAlert)
+                responseCode = .success
+            case .startSession:
+                // Also restarts a running session: previous data is discarded (§3.7.2.8).
+                startSession()
+                responseCode = .success
+            case .stopSession:
+                if sessionState == .running {
+                    stopSession()
+                    responseCode = .success
+                } else {
+                    // §3.7.2.9: stopping a session that is not running is Op Code not supported.
+                    responseCode = .opCodeNotSupported
+                }
+            case .communicationIntervalResponse, .glucoseCalibrationValueResponse, .patientHighAlertLevelResponse,
+                 .patientLowAlertLevelResponse, .hypoAlertLevelResponse, .hyperAlertLevelResponse,
+                 .rateOfDecreaseAlertLevelResponse, .rateOfIncreaseAlertLevelResponse, .responseCode:
+                responseCode = .opCodeNotSupported   // unreachable: requestOperand is nil for these
             }
-        default:
-            responseCode = .opCodeNotSupported
+        } catch {
+            // Only field validation can fail here (calibration type or sample location nibble).
+            ConsoleOut.shared.logMessage(message: "\(#function): rejected operand: \(error)")
+            responseCode = .invalidOperand
         }
         indicateSpecificOpsResponse(request: requestOpcode, code: responseCode)
         return .success
     }
 
     private func indicateSpecificOpsResponse(request: UInt8, code: CGMSpecificOpsResponseCode) {
-        let response = CGMSpecificOpsResponse.responseCode(request: request, code: code.rawValue)
+        indicateSpecificOps(.responseCode(request: request, code: code.rawValue))
+    }
+
+    private func indicateSpecificOps(_ response: CGMSpecificOpsResponse) {
         indicate(response.encoded(e2eCRC: isE2EProtectionSupported), on: .specificOpsControlPoint)
     }
 

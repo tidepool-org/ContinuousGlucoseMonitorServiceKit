@@ -93,7 +93,7 @@ struct MockCGMSensorTests {
         #expect(sensor.timeOffset == 0)
         let status = try CGMStatus(data: sensor.readStatus().1, e2eCRC: false)
         #expect(status.timeOffset == 0)
-        #expect(status.sensorStatus == [.sessionStopped])
+        #expect(status.sensorStatus == [.sessionStopped, .calibrationRecommended])   // no calibration stored yet
         #expect(sensor.sessionStartTime == nil)
 
         sensor.startSession()
@@ -133,7 +133,7 @@ struct MockCGMSensorTests {
 
         let status = try CGMStatus(data: sensor.readStatus().1, e2eCRC: false)
         #expect(status.timeOffset == 0)
-        #expect(status.sensorStatus == [])
+        #expect(status.sensorStatus == [.calibrationRecommended])   // fresh sensor asks for a first calibration
     }
 
     @Test func timeOffsetAdvancesWithTheClock() {
@@ -216,7 +216,7 @@ struct MockCGMSensorTests {
         #expect(sensor.timeOffset == 0)
         #expect(sensor.sessionStartTime?.date == box.now)   // new session, new clock-derived start
         #expect(!sensor.sessionStartTimeSetByCollector)
-        #expect(sensor.sensorStatus == [])
+        #expect(sensor.sensorStatus == [.calibrationRecommended])
     }
 
     // MARK: - Measurements
@@ -231,7 +231,7 @@ struct MockCGMSensorTests {
         #expect(record.timeOffset == 12)
         #expect(record.trend == 0)                 // trend feature on by default, flat trace
         #expect(record.quality == 100)             // quality feature on by default
-        #expect(record.sensorStatus == [])
+        #expect(record.sensorStatus == [.calibrationRecommended])   // no calibration stored yet
         #expect(sensor.lastMeasurement == record)
         #expect(queue.items.isEmpty)               // nobody subscribed yet
     }
@@ -416,12 +416,15 @@ struct MockCGMSensorTests {
         #expect(sensor.lastMeasurement == nil)   // §3.7.2.8: previous session data discarded
     }
 
-    @Test func cgmcpAnswersOpCodeNotSupportedForUnimplementedProcedures() {
-        let request = Data([CGMSpecificOpsOpcode.getCommunicationInterval.rawValue])
-        #expect(sensor.writeSpecificOpsControlPoint(request) == .success)
+    @Test func cgmcpAnswersOpCodeNotSupportedForUnknownOpCodes() {
+        // 0x30 is outside Table 3.6; a response op code written by a client is equally unknown.
+        #expect(sensor.writeSpecificOpsControlPoint(Data([0x30])) == .success)
         #expect(queue.items.count == 1)
         #expect(queue.items[0].uuid == CGMCharacteristicUUID.specificOpsControlPoint.cbUUID)
-        #expect(queue.items[0].value == Data([0x1C, 0x02, 0x02]))
+        #expect(queue.items[0].value == Data([0x1C, 0x30, 0x02]))
+
+        #expect(sensor.writeSpecificOpsControlPoint(Data([CGMSpecificOpsOpcode.responseCode.rawValue, 0x01, 0x01])) == .success)
+        #expect(queue.items.last?.value == Data([0x1C, 0x1C, 0x02]))
     }
 
     @Test func cgmcpResponseCarriesCRCWhenE2ESupported() {
@@ -460,9 +463,10 @@ struct MockCGMSensorTests {
         #expect(queue.items.last?.value.prefix(3) == Data([0x1C, 0x07, 0x03]))
         #expect(queue.items.last?.value.isCRCValid == true)
 
-        // Right size and CRC: reaches the procedure (not yet implemented → Op Code Not Supported).
+        // Right size and CRC: reaches the procedure and the level is stored.
         #expect(sensor.writeSpecificOpsControlPoint(level.appendingCRC()) == .success)
-        #expect(queue.items.last?.value.prefix(3) == Data([0x1C, 0x07, 0x02]))
+        #expect(queue.items.last?.value.prefix(3) == Data([0x1C, 0x07, 0x01]))
+        #expect(sensor.alertLevels.patientHigh == 180)
     }
 
     @Test func measurementIntervalRejectsNonPositiveValues() {
