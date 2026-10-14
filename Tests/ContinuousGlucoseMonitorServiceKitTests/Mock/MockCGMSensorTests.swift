@@ -86,7 +86,7 @@ struct MockCGMSensorTests {
 
     @Test func powersOnIdleUntilSessionStarts() throws {
         #expect(sensor.sessionState == .notStarted)
-        #expect(sensor.nextMeasurementDate == nil)
+        #expect(sensor.nextMeasurementDate != nil)   // the cadence ticks from power-on, status-only until a session runs
         #expect(sensor.takeMeasurement() == nil)
 
         box.now = startedAt.addingTimeInterval(20 * 60)
@@ -359,7 +359,7 @@ struct MockCGMSensorTests {
         #expect(sensor.measurementCount == count - 1)   // one delegate call came from the interval change
         #expect(sensor.nextMeasurementDate.map { $0 > Date() } == true)
         sensor.stopSession()
-        #expect(sensor.nextMeasurementDate == nil)
+        #expect(sensor.nextMeasurementDate != nil)   // keeps ticking; the ticks now carry status only
     }
 
     final class CountingDelegate: MockCGMSensorDelegate {
