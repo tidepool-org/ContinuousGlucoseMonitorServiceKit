@@ -251,6 +251,26 @@ struct MockCGMSensorLifecycleTests {
         #expect(afterEdit > 0.9 && afterEdit <= 1.0, "cadence should restart from the edit, got \(afterEdit)")
     }
 
+    // MARK: Device clock (HYD-C-015/016)
+
+    /// The device clock is the host clock plus the tester's offset: Session Start Time and Time Offset follow
+    /// it, the lifecycle log keeps host time, and a mid-session change moves Time Offset.
+    @Test func clockOffsetSkewsWhatTheCollectorSees() throws {
+        sensor.clockOffset = 10 * 60
+        sensor.startSession()
+        #expect(sensor.now() == startedAt.addingTimeInterval(10 * 60))
+        #expect(try #require(sensor.sessionStartTime).date == startedAt.addingTimeInterval(10 * 60))
+        #expect(sensor.timeOffset == 0)
+        #expect(sensor.lifecycleEvents.last?.date == startedAt)
+
+        box.now = startedAt.addingTimeInterval(5 * 60)
+        #expect(sensor.timeOffset == 5)
+        sensor.clockOffset = 30 * 60   // the device clock jumps 20 min ahead
+        #expect(sensor.timeOffset == 25)
+        sensor.clockOffset = -60 * 60  // and back before the session started: never negative
+        #expect(sensor.timeOffset == 0)
+    }
+
     @Test func replaceNotifiesTheDelegateOnce() {
         let spy = DelegateSpy()
         sensor.delegate = spy

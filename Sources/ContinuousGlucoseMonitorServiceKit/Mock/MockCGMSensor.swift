@@ -24,7 +24,23 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     let gattServer: GATTService
     let messageQueue: MessagingQueue
-    private let now: () -> Date
+    private let hostNow: () -> Date
+
+    /// Tester-set skew of the device clock against the host (HYD-C-015). Session Start Time is reported in
+    /// device time, so a collector that trusts it timestamps readings off by this much; Time Offset counts in
+    /// device time too, so changing the skew mid-session moves it. Lifecycle events keep host time.
+    public var clockOffset: TimeInterval = 0 {
+        didSet {
+            guard oldValue != clockOffset else { return }
+            notifyDelegate()
+        }
+    }
+
+    /// The device clock (HYD-C-016): the host clock plus `clockOffset`. Everything the collector can see
+    /// (Session Start Time, Time Offset, warm-up) is measured on this clock.
+    public func now() -> Date {
+        hostNow().addingTimeInterval(clockOffset)
+    }
 
     public weak var delegate: MockCGMSensorDelegate?
 
@@ -103,6 +119,17 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// Position in a scripted scenario; advances once per measurement.
     private var scenarioIndex = 0
+
+    /// Noise, outliers and failed samples on top of the trace (CGM-DESIGN §Glucose trace). A new seed
+    /// restarts the stream at once; Start Session restarts it anyway so a session replays identically.
+    public var traceEffects: CGMTraceEffects = .none {
+        didSet {
+            guard oldValue != traceEffects else { return }
+            if oldValue.seed != traceEffects.seed { effectsGenerator = CGMSeededGenerator(seed: traceEffects.seed) }
+            notifyDelegate()
+        }
+    }
+    private var effectsGenerator = CGMSeededGenerator(seed: CGMTraceEffects.none.seed)
 
     // MARK: Record database (CGMS §3.6)
 
@@ -350,7 +377,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         self.requiresEncryption = requiresEncryption
         self.deviceInformation = deviceInformation
         self.feature = feature
-        self.now = now
+        self.hostNow = now
         // A sensor powers on idle; Start Session comes from the tester UI or the collector (CGMS §3.7.2.8).
         self.sessionState = .notStarted
         self.sessionStartedAt = now()
@@ -449,6 +476,7 @@ public final class MockCGMSensor: @unchecked Sendable {
             lastMeasurement = nil
             measurementCount = 0
             scenarioIndex = 0
+            effectsGenerator = CGMSeededGenerator(seed: traceEffects.seed)   // HYD-C-018: same session, same noise
             recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
             racpReportQueued = false
             calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
@@ -531,7 +559,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     }
 
     private func recordLifecycle(_ kind: CGMLifecycleEvent.Kind, source: CGMLifecycleEvent.Source, accepted: Bool = true, note: String? = nil) {
-        let event = CGMLifecycleEvent(date: now(), kind: kind, source: source, accepted: accepted, collectorSubscribed: isMeasurementNotificationConfigured, timeOffset: timeOffset, note: note)
+        let event = CGMLifecycleEvent(date: hostNow(), kind: kind, source: source, accepted: accepted, collectorSubscribed: isMeasurementNotificationConfigured, timeOffset: timeOffset, note: note)
         lifecycleEvents.append(event)
         if lifecycleEvents.count > Self.lifecycleEventLimit {
             lifecycleEvents.removeFirst(lifecycleEvents.count - Self.lifecycleEventLimit)
@@ -643,7 +671,10 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// scenario value when the source is scripted.
     private func makeRecord(elapsed: TimeInterval, timeOffset: UInt16) -> CGMMeasurementRecord {
         let index = scenarioIndex
-        var glucose = trace.glucose(elapsed: elapsed, index: index).rounded()
+        // HYD-C-018: the effects draw from the seeded stream on every reading, inert or not, so the stream
+        // stays aligned with the reading count and a session replays identically.
+        let sample = traceEffects.apply(to: trace.glucose(elapsed: elapsed, index: index), using: &effectsGenerator)
+        var glucose = sample?.rounded() ?? .nan
         var trend = feature.flags.contains(.trendInformation) ? (trace.trend(elapsed: elapsed, index: index) * 10).rounded() / 10 : nil
         var quality: Double? = feature.flags.contains(.quality) ? 100 : nil
 
@@ -651,6 +682,11 @@ public final class MockCGMSensor: @unchecked Sendable {
         if condition != .healthy {
             // TBD-05 / HYD-G-006: an impaired or failed sensor cannot quantify; the record carries the fault bit.
             glucose = .nan
+            trend = nil
+            quality = quality.map { _ in 0 }
+        } else if sample == nil {
+            // A failed sample from the trace effects: no value and no confidence, but no fault bit either,
+            // since the sensor itself is fine and the next reading will be normal.
             trend = nil
             quality = quality.map { _ in 0 }
         } else {
