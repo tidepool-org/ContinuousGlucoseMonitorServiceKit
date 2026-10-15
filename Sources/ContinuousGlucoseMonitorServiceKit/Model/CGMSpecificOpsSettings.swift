@@ -60,13 +60,6 @@ public struct CGMAlertLevels: Equatable, Sendable {
         }
         return bits
     }
-
-    /// Bits this struct can set, so a caller can clear them before re-evaluating.
-    public static let annunciationBits: CGMSensorStatusAnnunciation = [
-        .resultHigherThanPatientHigh, .resultLowerThanPatientLow,
-        .resultLowerThanHypo, .resultHigherThanHyper,
-        .rateOfIncreaseExceeded, .rateOfDecreaseExceeded
-    ]
 }
 
 extension CGMSpecificOpsOpcode {
