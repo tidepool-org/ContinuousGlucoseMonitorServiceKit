@@ -84,6 +84,8 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.lastStatusRecord == status)
         #expect(sensor.recordStore.count == 1)
         #expect(sensor.takeMeasurement() == nil)
+        #expect(sensor.backfill(duration: 3600) == 0)   // nor did it produce any while "unattended"
+        #expect(sensor.recordStore.count == 1)
         #expect(sensor.sessionState == .running)   // the session itself is untouched; RACP still serves
         #expect(sensor.sensorStatus.contains(.sensorMalfunction))
         #expect(sensor.lifecycleEvents.last?.kind == .sensorFailed)
@@ -222,7 +224,7 @@ struct MockCGMSensorLifecycleTests {
     }
 
     /// Real timers: the first reading goes out when the warm-up ends and the cadence counts from there, so a
-    /// warm-up on a 5 min cadence reads at 1:00, 6:00, 11:00. With no warm-up it goes out at Start Session.
+    /// warm-up on a 5 min cadence reads at 1:00, 6:00, 11:00.
     @Test @MainActor func cadenceStartsAtWarmupEnd() {
         let server = MockGATTService()
         let queue = MockMessageQueue(gattServer: server)
@@ -238,10 +240,15 @@ struct MockCGMSensorLifecycleTests {
         let next = sensor.nextMeasurementDate.map { $0.timeIntervalSinceNow } ?? 0
         #expect(next > 0.7 && next <= 1.0, "next reading should be one interval after the warm-up end, got \(next)")
 
-        sensor.warmupDuration = 0
+        // Shortening a warm-up past its end reports at once and counts the cadence from that moment.
+        sensor.warmupDuration = 10
         sensor.startSession()
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        #expect(sensor.measurementCount == 0)
+        sensor.warmupDuration = 0.01
         #expect(sensor.measurementCount == 1)
+        let afterEdit = sensor.nextMeasurementDate.map { $0.timeIntervalSinceNow } ?? 0
+        #expect(afterEdit > 0.9 && afterEdit <= 1.0, "cadence should restart from the edit, got \(afterEdit)")
     }
 
     @Test func replaceNotifiesTheDelegateOnce() {

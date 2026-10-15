@@ -456,8 +456,9 @@ public final class MockCGMSensor: @unchecked Sendable {
             rangeStatus = []
             sessionState = .running
             ConsoleOut.shared.logMessage(message: "\(#function): session started at \(sessionStartedAt)")
-            // First reading when the warm-up ends (at once with no warm-up), then every interval from there.
-            scheduleMeasurementTimer(firstFireAt: sessionStartedAt.addingTimeInterval(warmupDuration))
+            // With a warm-up the first reading goes out when it ends and the cadence counts from there;
+            // without one the first reading is a full interval away, as before.
+            scheduleMeasurementTimer(firstFireAt: warmupDuration > 0 ? sessionStartedAt.addingTimeInterval(warmupDuration) : nil)
             recordLifecycle(.sessionStarted, source: source)
         }
         return true
@@ -611,7 +612,9 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// collector is out of range; it learns about the records through RACP. Returns how many were added.
     @discardableResult
     public func backfill(duration: TimeInterval) -> Int {
-        guard sessionState == .running, duration > 0 else { return 0 }
+        // HYD-G-006: a failed sensor produces no readings, unattended or not. An impaired one still records
+        // NaN with the fault bit, as the cadence does.
+        guard sessionState == .running, condition != .failed, duration > 0 else { return 0 }
         let count = Int(duration / measurementInterval)
         guard count > 0 else { return 0 }
 
@@ -688,18 +691,23 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// tick notifies, and only a running, warmed-up, healthy sensor puts a glucose value in the record.
     /// `firstFireAt` (in the sensor's clock) anchors the ticks: Start Session passes the warm-up end so the
     /// first reading goes out then and a 1 min warm-up on a 5 min cadence reads at 1:00, 6:00, 11:00. Without
-    /// it the first tick is a full interval away (power-on, interval change).
+    /// it the first tick is a full interval away (power-on, interval change, no warm-up).
     private func scheduleMeasurementTimer(firstFireAt firstFire: Date? = nil) {
         measurementTimer?.invalidate()
         measurementTimer = nil
-        // Relative to the wall clock: a frozen test clock must not produce a fire date in the past.
-        let delay = firstFire.map { max(0, $0.timeIntervalSince(now())) } ?? measurementInterval
+        // Relative to the wall clock: a frozen test clock must not produce a fire date in the past. A first
+        // fire that is already due (a warm-up shortened past its end) is reported synchronously below rather
+        // than through a zero-delay timer, so the cadence counts from this moment.
+        let untilFirstFire = firstFire.map { $0.timeIntervalSince(now()) } ?? measurementInterval
+        let dueNow = untilFirstFire <= 0
+        let delay = dueNow ? measurementInterval : untilFirstFire
         let timer = Timer(fire: Date().addingTimeInterval(delay), interval: measurementInterval, repeats: true) { [weak self] _ in
             self?.communicate()
         }
         // Common modes so the timer keeps firing while the tester scrolls the UI (default mode pauses then).
         RunLoop.main.add(timer, forMode: .common)
         measurementTimer = timer
+        if dueNow { communicate() }
     }
 
     /// One communication, whether a cadence tick or an immediate report of a condition change: a reading when
