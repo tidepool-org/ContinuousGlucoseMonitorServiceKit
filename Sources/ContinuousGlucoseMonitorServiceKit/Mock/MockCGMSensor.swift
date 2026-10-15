@@ -38,8 +38,9 @@ public final class MockCGMSensor: @unchecked Sendable {
     public var feature: CGMFeature {
         didSet {
             guard oldValue != feature else { return }
-            // An alert family switched off must leave Status at once, not at the next reading.
+            // An alert family or range detection switched off must leave Status at once, not at the next reading.
             refreshAlertStatus()
+            refreshRangeStatus()
             indicateFeatureIfSubscribed()
             notifyDelegate()
         }
@@ -226,12 +227,61 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// Annunciation bits the latest reading tripped against `alertLevels`; recomputed on every measurement.
     public private(set) var alertStatus: CGMSensorStatusAnnunciation = []
 
+    // MARK: Lifecycle (CGM-DESIGN §Lifecycle)
+
+    /// Seconds after Start Session before readings begin (TBD-03 warm-up). Editable while a warm-up is in
+    /// progress: shortening it below the elapsed time ends the warm-up at once. Zero in the kit so tests run
+    /// without waiting; the simulator app defaults to one minute.
+    public var warmupDuration: TimeInterval = 0 {
+        didSet {
+            guard oldValue != warmupDuration else { return }
+            // Editing a warm-up in progress, or ending it outright, re-anchors the cadence to the new end so
+            // the first reading goes out then. Outside a warm-up the running cadence is left alone.
+            let wasWarmingUp = sessionState == .running && now().timeIntervalSince(sessionStartedAt) < oldValue
+            if wasWarmingUp || isWarmingUp {
+                scheduleMeasurementTimer(firstFireAt: sessionStartedAt.addingTimeInterval(warmupDuration))
+            }
+            notifyDelegate()
+        }
+    }
+
+    /// True while a running session is still inside its warm-up: the timer ticks but no reading is produced.
+    public var isWarmingUp: Bool {
+        sessionState == .running && now().timeIntervalSince(sessionStartedAt) < warmupDuration
+    }
+
+    /// When the current warm-up ends; nil when none is in progress.
+    public var warmupEndDate: Date? {
+        isWarmingUp ? sessionStartedAt.addingTimeInterval(warmupDuration) : nil
+    }
+
+    /// Physical condition the tester has inflicted; changes through `failSensor`, `beginTemporaryIssue`,
+    /// `resolveTemporaryIssue` and `replaceSensor`.
+    public private(set) var condition: CGMSensorCondition = .healthy
+
+    /// Glucose the sensor can quantify (HYD-G-003). With Sensor Result High-Low Detection in the Feature, a
+    /// reading outside is reported at the boundary with the matching Device Can Process bit.
+    public var sensorRange: ClosedRange<Double> = 40...400 {
+        didSet {
+            guard oldValue != sensorRange else { return }
+            refreshRangeStatus()
+            notifyDelegate()
+        }
+    }
+
+    /// Device Can Process bits of the latest reading.
+    public private(set) var rangeStatus: CGMSensorStatusAnnunciation = []
+
+    /// Lifecycle actions in order, newest last, capped at `lifecycleEventLimit`.
+    public private(set) var lifecycleEvents: [CGMLifecycleEvent] = []
+    public static let lifecycleEventLimit = 200
+
     public private(set) var lastMeasurement: CGMMeasurementRecord?
 
     /// Measurements taken in the current session; lets a tester see activity when the value barely moves.
     public private(set) var measurementCount = 0
 
-    /// When the timer will next sample the trace; nil while no session is running.
+    /// When the cadence next fires: a reading if the sensor can take one, a status-only notification otherwise.
     public var nextMeasurementDate: Date? {
         guard let timer = measurementTimer else { return nil }
         // Inside the timer's own callback `fireDate` still holds the instant that just fired; the run loop
@@ -360,8 +410,14 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// reading, and the calibration bits that applied at that moment.
     private func sensorStatus(at offset: UInt16) -> CGMSensorStatusAnnunciation {
         // Time Synchronization Required is tester-controlled: the sensor knows its own start time.
-        var status = manualSensorStatus.union(alertStatus).union(calibrationStatus(at: offset))
+        var status = manualSensorStatus.union(alertStatus).union(rangeStatus).union(calibrationStatus(at: offset))
         if sessionState != .running { status.insert(.sessionStopped) }
+        // The condition shows only through the fault bits the Feature advertises.
+        switch condition {
+        case .healthy: break
+        case .impaired: if feature.flags.contains(.generalDeviceFault) { status.insert(.generalDeviceFault) }
+        case .failed: if feature.flags.contains(.sensorMalfunctionDetection) { status.insert(.sensorMalfunction) }
+        }
         return status
     }
 
@@ -374,10 +430,17 @@ public final class MockCGMSensor: @unchecked Sendable {
         sessionStartTime ?? CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
     }
 
-    // MARK: - Session control (tester UI)
+    // MARK: - Session control (tester UI and CGMCP)
 
-    /// Starts a new session: Time Offset restarts at 0 and Session Start Time is taken from the device clock.
-    public func startSession() {
+    /// Starts a new session: Time Offset restarts at 0, Session Start Time is taken from the device clock and
+    /// the warm-up begins. Refused while the sensor has failed (HYD-G-006: terminal until replaced), which
+    /// is recorded as a rejected lifecycle event. Returns whether the session started.
+    @discardableResult
+    public func startSession(source: CGMLifecycleEvent.Source = .tester) -> Bool {
+        guard condition != .failed else {
+            recordLifecycle(.sessionStarted, source: source, accepted: false, note: "sensor failed; replace it first")
+            return false
+        }
         batchingDelegateUpdates {
             sessionStartedAt = now()
             sessionStoppedAt = nil
@@ -390,19 +453,90 @@ public final class MockCGMSensor: @unchecked Sendable {
             racpReportQueued = false
             calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
             alertStatus = []
+            rangeStatus = []
             sessionState = .running
             ConsoleOut.shared.logMessage(message: "\(#function): session started at \(sessionStartedAt)")
-            scheduleMeasurementTimer()
+            // With a warm-up the first reading goes out when it ends and the cadence counts from there;
+            // without one the first reading is a full interval away, as before.
+            scheduleMeasurementTimer(firstFireAt: warmupDuration > 0 ? sessionStartedAt.addingTimeInterval(warmupDuration) : nil)
+            recordLifecycle(.sessionStarted, source: source)
+        }
+        return true
+    }
+
+    /// Stops the running session (CGMS §3.7.2.9; TBD-08). Returns false, and records the rejection, when no
+    /// session is running.
+    @discardableResult
+    public func stopSession(source: CGMLifecycleEvent.Source = .tester) -> Bool {
+        stopSession(source: source, kind: .sessionStopped)
+    }
+
+    private func stopSession(source: CGMLifecycleEvent.Source, kind: CGMLifecycleEvent.Kind) -> Bool {
+        guard sessionState == .running else {
+            recordLifecycle(kind, source: source, accepted: false, note: "no session running")
+            return false
+        }
+        batchingDelegateUpdates {
+            sessionStoppedAt = now()
+            sessionState = .stopped
+            // The cadence keeps ticking with status-only notifications (Session Stopped bit).
+            ConsoleOut.shared.logMessage(message: "\(#function): session stopped at time offset \(timeOffset)")
+            recordLifecycle(kind, source: source)
+        }
+        return true
+    }
+
+    // MARK: - Sensor condition (tester UI)
+
+    /// HYD-G-006: a terminal failure. One final record with NaN glucose and Sensor Malfunction goes out so
+    /// the collector learns of it, then readings stop; Status keeps the bit and only `replaceSensor()`
+    /// recovers. The session stays as it was so RACP can still serve what was stored.
+    public func failSensor() {
+        guard condition != .failed else { return }
+        batchingDelegateUpdates {
+            condition = .failed
+            recordLifecycle(.sensorFailed, source: .tester)
+            communicate()
         }
     }
 
-    public func stopSession() {
-        guard sessionState == .running else { return }
-        sessionStoppedAt = now()
-        sessionState = .stopped
-        measurementTimer?.invalidate()
-        measurementTimer = nil
-        ConsoleOut.shared.logMessage(message: "\(#function): session stopped at time offset \(timeOffset)")
+    /// TBD-05: a recoverable issue. Readings continue with NaN glucose, zero quality and General Device
+    /// Fault, starting with one sent immediately.
+    public func beginTemporaryIssue() {
+        guard condition == .healthy else { return }
+        batchingDelegateUpdates {
+            condition = .impaired
+            recordLifecycle(.temporaryIssueBegan, source: .tester)
+            communicate()
+        }
+    }
+
+    public func resolveTemporaryIssue() {
+        guard condition == .impaired else { return }
+        batchingDelegateUpdates {
+            condition = .healthy
+            recordLifecycle(.temporaryIssueResolved, source: .tester)
+            communicate()
+        }
+    }
+
+    /// TBD-07: a new sensor. Clears any failure or issue and starts a fresh session (new warm-up, empty
+    /// record and calibration databases). A collector learns of it through Status and the measurements.
+    public func replaceSensor() {
+        batchingDelegateUpdates {
+            condition = .healthy
+            recordLifecycle(.sensorReplaced, source: .tester)
+            startSession(source: .tester)
+        }
+    }
+
+    private func recordLifecycle(_ kind: CGMLifecycleEvent.Kind, source: CGMLifecycleEvent.Source, accepted: Bool = true, note: String? = nil) {
+        let event = CGMLifecycleEvent(date: now(), kind: kind, source: source, accepted: accepted, collectorSubscribed: isMeasurementNotificationConfigured, timeOffset: timeOffset, note: note)
+        lifecycleEvents.append(event)
+        if lifecycleEvents.count > Self.lifecycleEventLimit {
+            lifecycleEvents.removeFirst(lifecycleEvents.count - Self.lifecycleEventLimit)
+        }
+        ConsoleOut.shared.logMessage(message: "lifecycle: \(event)")
         notifyDelegate()
     }
 
@@ -412,8 +546,29 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// notification). Also callable from the tester UI for an out-of-cadence reading.
     @discardableResult
     public func takeMeasurement() -> CGMMeasurementRecord? {
-        guard sessionState == .running else { return nil }
+        // An expiry found here (tester's Measure Now) is reported at once, as the cadence would.
+        if expireSessionIfDue() {
+            notifyStatusRecord()
+            return nil
+        }
+        // TBD-03: no reading during warm-up. HYD-G-006: a failed sensor produces no readings; the cadence
+        // keeps sending status-only notifications in both cases.
+        guard sessionState == .running, !isWarmingUp, condition != .failed else { return nil }
+        return captureReading()
+    }
 
+    /// HYD-G-009: the session ends by itself once its run time has elapsed. True when it just did.
+    private func expireSessionIfDue() -> Bool {
+        guard sessionState == .running, Int(timeOffset) >= Int(sessionRunTime.hours) * 60 else { return false }
+        _ = stopSession(source: .sensor, kind: .sessionExpired)
+        return true
+    }
+
+    /// Takes one reading in the current condition, stores it and notifies it. CGM Status cannot be notified
+    /// (read only in CGMS Table 3.1), so a record is the only way a condition change reaches the collector;
+    /// `failSensor` and the temporary-issue transitions call this directly to report at once.
+    @discardableResult
+    private func captureReading() -> CGMMeasurementRecord {
         let record = makeRecord(elapsed: now().timeIntervalSince(sessionStartedAt), timeOffset: timeOffset)
         lastMeasurement = record
         measurementCount += 1
@@ -435,13 +590,31 @@ public final class MockCGMSensor: @unchecked Sendable {
         alertStatus = alertLevels.annunciation(glucose: last.glucoseConcentration, trend: last.trend, feature: feature.flags)
     }
 
+    /// HYD-G-003: outside the sensor range the boundary is reported with the matching Device Can Process bit.
+    /// Nothing is clamped or flagged unless the Feature advertises Sensor Result High-Low Detection.
+    private func clampedToSensorRange(_ glucose: Double) -> (glucose: Double, status: CGMSensorStatusAnnunciation) {
+        guard feature.flags.contains(.sensorResultHighLowDetection), glucose.isFinite else { return (glucose, []) }
+        if glucose > sensorRange.upperBound { return (sensorRange.upperBound, .resultHigherThanDeviceCanProcess) }
+        if glucose < sensorRange.lowerBound { return (sensorRange.lowerBound, .resultLowerThanDeviceCanProcess) }
+        return (glucose, [])
+    }
+
+    /// Re-evaluates the latest reading when the range or the Feature changes, so Status drops or gains the
+    /// Device Can Process bit at once rather than at the next reading. The reading was already clamped, so a
+    /// widened range clears the bit and a narrowed one sets it.
+    private func refreshRangeStatus() {
+        rangeStatus = lastMeasurement.map { clampedToSensorRange($0.glucoseConcentration).status } ?? []
+    }
+
     /// Fills the database as if the sensor had been running unattended for `duration` (HYD-G-015 test aid):
     /// the session start moves back by that much, so Time Offset jumps, and one record per measurement
     /// interval is generated from the glucose source for the gap. Nothing is notified, exactly as when the
     /// collector is out of range; it learns about the records through RACP. Returns how many were added.
     @discardableResult
     public func backfill(duration: TimeInterval) -> Int {
-        guard sessionState == .running, duration > 0 else { return 0 }
+        // HYD-G-006: a failed sensor produces no readings, unattended or not. An impaired one still records
+        // NaN with the fault bit, as the cadence does.
+        guard sessionState == .running, condition != .failed, duration > 0 else { return 0 }
         let count = Int(duration / measurementInterval)
         guard count > 0 else { return 0 }
 
@@ -470,8 +643,20 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// scenario value when the source is scripted.
     private func makeRecord(elapsed: TimeInterval, timeOffset: UInt16) -> CGMMeasurementRecord {
         let index = scenarioIndex
-        let glucose = trace.glucose(elapsed: elapsed, index: index).rounded()
-        let trend = feature.flags.contains(.trendInformation) ? (trace.trend(elapsed: elapsed, index: index) * 10).rounded() / 10 : nil
+        var glucose = trace.glucose(elapsed: elapsed, index: index).rounded()
+        var trend = feature.flags.contains(.trendInformation) ? (trace.trend(elapsed: elapsed, index: index) * 10).rounded() / 10 : nil
+        var quality: Double? = feature.flags.contains(.quality) ? 100 : nil
+
+        rangeStatus = []
+        if condition != .healthy {
+            // TBD-05 / HYD-G-006: an impaired or failed sensor cannot quantify; the record carries the fault bit.
+            glucose = .nan
+            trend = nil
+            quality = quality.map { _ in 0 }
+        } else {
+            (glucose, rangeStatus) = clampedToSensorRange(glucose)
+        }
+
         // §3.7.2.3–3.7.2.6: the reading is compared against the alert levels and the record carries the result.
         alertStatus = alertLevels.annunciation(glucose: glucose, trend: trend, feature: feature.flags)
         let record = CGMMeasurementRecord(
@@ -479,7 +664,7 @@ public final class MockCGMSensor: @unchecked Sendable {
             timeOffset: timeOffset,
             sensorStatus: sensorStatus(at: timeOffset),   // a backfilled record carries its own moment's bits
             trend: trend,
-            quality: feature.flags.contains(.quality) ? 100 : nil
+            quality: quality
         )
         scenarioIndex += 1
         return record
@@ -502,16 +687,55 @@ public final class MockCGMSensor: @unchecked Sendable {
         return gattServer.isCharacteristicSubscribed(uuid) == true
     }
 
-    private func scheduleMeasurementTimer() {
+    /// The communication cadence runs from power-on regardless of session state (Nate, 2026-10-15): every
+    /// tick notifies, and only a running, warmed-up, healthy sensor puts a glucose value in the record.
+    /// `firstFireAt` (in the sensor's clock) anchors the ticks: Start Session passes the warm-up end so the
+    /// first reading goes out then and a 1 min warm-up on a 5 min cadence reads at 1:00, 6:00, 11:00. Without
+    /// it the first tick is a full interval away (power-on, interval change, no warm-up).
+    private func scheduleMeasurementTimer(firstFireAt firstFire: Date? = nil) {
         measurementTimer?.invalidate()
         measurementTimer = nil
-        guard sessionState == .running else { return }
-        let timer = Timer(timeInterval: measurementInterval, repeats: true) { [weak self] _ in
-            self?.takeMeasurement()
+        // Relative to the wall clock: a frozen test clock must not produce a fire date in the past. A first
+        // fire that is already due (a warm-up shortened past its end) is reported synchronously below rather
+        // than through a zero-delay timer, so the cadence counts from this moment.
+        let untilFirstFire = firstFire.map { $0.timeIntervalSince(now()) } ?? measurementInterval
+        let dueNow = untilFirstFire <= 0
+        let delay = dueNow ? measurementInterval : untilFirstFire
+        let timer = Timer(fire: Date().addingTimeInterval(delay), interval: measurementInterval, repeats: true) { [weak self] _ in
+            self?.communicate()
         }
         // Common modes so the timer keeps firing while the tester scrolls the UI (default mode pauses then).
         RunLoop.main.add(timer, forMode: .common)
         measurementTimer = timer
+        if dueNow { communicate() }
+    }
+
+    /// One communication, whether a cadence tick or an immediate report of a condition change: a reading when
+    /// the sensor can produce one, otherwise a status-only notification carrying the current bits (including
+    /// Session Stopped when the run time has just expired).
+    private func communicate() {
+        // Expiry first so the status record goes out once, not from both this path and takeMeasurement.
+        if expireSessionIfDue() || takeMeasurement() == nil { notifyStatusRecord() }
+    }
+
+    /// Most recent status-only notification (no glucose), for the UI.
+    public private(set) var lastStatusRecord: CGMMeasurementRecord?
+
+    /// A record carrying only Time Offset and the status bits: NaN glucose, no trend, zero quality. This is
+    /// how a stopped, warming-up or failed sensor keeps talking to the collector, since CGM Status itself
+    /// cannot be notified (CGMS Table 3.1). Notified, never stored: it is not a measurement.
+    private func notifyStatusRecord() {
+        let record = CGMMeasurementRecord(
+            glucoseConcentration: .nan,
+            timeOffset: timeOffset,
+            sensorStatus: sensorStatus,
+            trend: nil,
+            quality: feature.flags.contains(.quality) ? 0 : nil
+        )
+        lastStatusRecord = record
+        ConsoleOut.shared.logMessage(message: "status notification: \(record)")
+        if isPeriodicCommunicationEnabled { notifyMeasurements([record]) }
+        notifyDelegate()
     }
 
     // MARK: - Read handlers
@@ -733,17 +957,12 @@ public final class MockCGMSensor: @unchecked Sendable {
                 manualSensorStatus.remove(.deviceSpecificAlert)
                 responseCode = .success
             case .startSession:
-                // Also restarts a running session: previous data is discarded (§3.7.2.8).
-                startSession()
-                responseCode = .success
+                // Also restarts a running session: previous data is discarded (§3.7.2.8). A failed sensor
+                // cannot start one until the tester replaces it (HYD-G-006).
+                responseCode = startSession(source: .collector) ? .success : .procedureNotCompleted
             case .stopSession:
-                if sessionState == .running {
-                    stopSession()
-                    responseCode = .success
-                } else {
-                    // §3.7.2.9: stopping a session that is not running is Op Code not supported.
-                    responseCode = .opCodeNotSupported
-                }
+                // §3.7.2.9: stopping a session that is not running is Op Code not supported.
+                responseCode = stopSession(source: .collector) ? .success : .opCodeNotSupported
             case .communicationIntervalResponse, .glucoseCalibrationValueResponse, .patientHighAlertLevelResponse,
                  .patientLowAlertLevelResponse, .hypoAlertLevelResponse, .hyperAlertLevelResponse,
                  .rateOfDecreaseAlertLevelResponse, .rateOfIncreaseAlertLevelResponse, .responseCode:
@@ -811,18 +1030,18 @@ public final class MockCGMSensor: @unchecked Sendable {
     }
 
     func notifyDelegate() {
-        guard !isBatchingDelegateUpdates else { return }
+        guard delegateBatchDepth == 0 else { return }
         delegate?.mockSensorDidUpdate(self)
     }
 
-    private var isBatchingDelegateUpdates = false
+    private var delegateBatchDepth = 0
 
     /// Runs `changes`, which may touch several observed properties, and tells the delegate once at the end
-    /// so it never sees a half-applied state.
+    /// so it never sees a half-applied state. Nests: only the outermost batch notifies.
     private func batchingDelegateUpdates(_ changes: () -> Void) {
-        isBatchingDelegateUpdates = true
+        delegateBatchDepth += 1
         changes()
-        isBatchingDelegateUpdates = false
+        delegateBatchDepth -= 1
         notifyDelegate()
     }
 

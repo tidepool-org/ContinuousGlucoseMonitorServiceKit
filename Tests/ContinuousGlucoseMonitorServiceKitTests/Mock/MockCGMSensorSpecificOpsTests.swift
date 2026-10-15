@@ -94,26 +94,15 @@ struct MockCGMSensorSpecificOpsTests {
         self.box = box
     }
 
-    final class ClockBox: @unchecked Sendable {
-        var now: Date
-        init(_ now: Date) { self.now = now }
-    }
-
-    private let cgmcp = CGMCharacteristicUUID.specificOpsControlPoint.cbUUID
     private let measurement = CGMCharacteristicUUID.measurement.cbUUID
 
     /// Writes `request` and returns the decoded indication it produced.
-    private func send(_ request: Data) throws -> CGMSpecificOpsResponse {
-        let before = queue.items.count
-        #expect(sensor.writeSpecificOpsControlPoint(request) == .success)
-        let item = try #require(queue.items.last)
-        #expect(queue.items.count == before + 1)
-        #expect(item.uuid == cgmcp)
-        return try CGMSpecificOpsResponse(data: item.value, e2eCRC: false)
+    private func send(_ request: Data, sourceLocation: SourceLocation = #_sourceLocation) throws -> CGMSpecificOpsResponse {
+        try cgmcpSend(request, to: sensor, queue: queue, sourceLocation: sourceLocation)
     }
 
     private func request(_ opcode: CGMSpecificOpsOpcode, operand: Data = Data()) -> Data {
-        CGMSpecificOpsRequest.encode(opcode, operand: operand, e2eCRC: false)
+        cgmcpRequest(opcode, operand: operand)
     }
 
     private func measurementValues() -> [Data] {
@@ -167,11 +156,6 @@ struct MockCGMSensorSpecificOpsTests {
         #expect(sensor.measurementInterval == 300)
         _ = sensor.takeMeasurement()
         #expect(measurementValues().count == 1)
-    }
-
-    final class DelegateSpy: MockCGMSensorDelegate {
-        var updates = 0
-        func mockSensorDidUpdate(_ sensor: MockCGMSensor) { updates += 1 }
     }
 
     /// One CGMCP write or one Start Session is one consistent update to observers, not several partial ones.

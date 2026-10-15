@@ -29,11 +29,6 @@ struct MockCGMSensorTests {
         self.box = box
     }
 
-    final class ClockBox: @unchecked Sendable {
-        var now: Date
-        init(_ now: Date) { self.now = now }
-    }
-
     // MARK: - GATT layout
 
     @Test func publishesCGMDeviceInformationBatteryAndAuthorizationServices() {
@@ -86,7 +81,7 @@ struct MockCGMSensorTests {
 
     @Test func powersOnIdleUntilSessionStarts() throws {
         #expect(sensor.sessionState == .notStarted)
-        #expect(sensor.nextMeasurementDate == nil)
+        #expect(sensor.nextMeasurementDate != nil)   // the cadence ticks from power-on, status-only until a session runs
         #expect(sensor.takeMeasurement() == nil)
 
         box.now = startedAt.addingTimeInterval(20 * 60)
@@ -342,7 +337,7 @@ struct MockCGMSensorTests {
 
         var count = 0
         var staleNextDates = 0
-        let probe = CountingDelegate { [weak sensor] in
+        let probe = DelegateSpy { [weak sensor] in
             count += 1
             // Observers are told from inside the timer callback; the next date must still lie ahead.
             if let next = sensor?.nextMeasurementDate, next <= Date() { staleNextDates += 1 }
@@ -359,13 +354,7 @@ struct MockCGMSensorTests {
         #expect(sensor.measurementCount == count - 1)   // one delegate call came from the interval change
         #expect(sensor.nextMeasurementDate.map { $0 > Date() } == true)
         sensor.stopSession()
-        #expect(sensor.nextMeasurementDate == nil)
-    }
-
-    final class CountingDelegate: MockCGMSensorDelegate {
-        let onUpdate: () -> Void
-        init(onUpdate: @escaping () -> Void) { self.onUpdate = onUpdate }
-        func mockSensorDidUpdate(_ sensor: MockCGMSensor) { onUpdate() }
+        #expect(sensor.nextMeasurementDate != nil)   // keeps ticking; the ticks now carry status only
     }
 
     // MARK: - Lifetime
