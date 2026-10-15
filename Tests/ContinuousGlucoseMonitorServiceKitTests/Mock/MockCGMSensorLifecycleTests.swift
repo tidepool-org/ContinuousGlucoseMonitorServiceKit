@@ -28,20 +28,10 @@ struct MockCGMSensorLifecycleTests {
         sensor.trace = .constant(mgdl: 120)
     }
 
-    final class ClockBox: @unchecked Sendable {
-        var now: Date
-        init(_ now: Date) { self.now = now }
-    }
-
-    final class DelegateSpy: MockCGMSensorDelegate {
-        var updates = 0
-        func mockSensorDidUpdate(_ sensor: MockCGMSensor) { updates += 1 }
-    }
-
-    private func cgmcp(_ opcode: CGMSpecificOpsOpcode) -> CGMSpecificOpsResponseCode? {
-        _ = sensor.writeSpecificOpsControlPoint(Data([opcode.rawValue]))
-        guard let value = queue.items.last?.value, value.count == 3, value[0] == 0x1C, value[1] == opcode.rawValue else { return nil }
-        return CGMSpecificOpsResponseCode(rawValue: value[2])
+    /// The response code a bare-opcode procedure answers with; nil when the sensor answered with a value instead.
+    private func cgmcp(_ opcode: CGMSpecificOpsOpcode) throws -> CGMSpecificOpsResponseCode? {
+        guard case .responseCode(opcode.rawValue, let code) = try cgmcpSend(cgmcpRequest(opcode), to: sensor, queue: queue) else { return nil }
+        return CGMSpecificOpsResponseCode(rawValue: code)
     }
 
     // MARK: Warm-up (TBD-03)
@@ -104,7 +94,7 @@ struct MockCGMSensorLifecycleTests {
         sensor.feature.flags.insert(.sensorMalfunctionDetection)
 
         // The collector cannot start a session on a failed sensor; the refusal is on record.
-        #expect(cgmcp(.startSession) == .procedureNotCompleted)
+        #expect(try cgmcp(.startSession) == .procedureNotCompleted)
         let rejected = try #require(sensor.lifecycleEvents.last)
         #expect(rejected.kind == .sessionStarted && rejected.source == .collector && !rejected.accepted)
         // Nor can the tester, other than by replacing it.
@@ -169,13 +159,25 @@ struct MockCGMSensorLifecycleTests {
         #expect(low.sensorStatus.contains(.resultLowerThanDeviceCanProcess))
         #expect(!low.sensorStatus.contains(.resultHigherThanDeviceCanProcess))
 
+        // Status follows a range change at once: widening clears the bit, narrowing below the last
+        // (clamped) reading sets it again.
+        sensor.sensorRange = 10...600
+        #expect(sensor.rangeStatus == [])
+        sensor.sensorRange = 50...600
+        #expect(sensor.sensorStatus.contains(.resultLowerThanDeviceCanProcess))
         sensor.sensorRange = 10...600
         let inRange = try #require(sensor.takeMeasurement())
         #expect(inRange.glucoseConcentration == 20)
         #expect(sensor.rangeStatus == [])
 
-        // Without the detection feature the raw value goes out and nothing is flagged.
+        // Without the detection feature the raw value goes out and nothing is flagged; switching it off
+        // drops a bit already in Status.
+        sensor.sensorRange = 40...400
+        sensor.trace = .constant(mgdl: 500)
+        _ = sensor.takeMeasurement()
+        #expect(sensor.sensorStatus.contains(.resultHigherThanDeviceCanProcess))
         sensor.feature.flags.remove(.sensorResultHighLowDetection)
+        #expect(sensor.rangeStatus == [])
         sensor.trace = .constant(mgdl: 700)
         let raw = try #require(sensor.takeMeasurement())
         #expect(raw.glucoseConcentration == 700)
@@ -186,12 +188,12 @@ struct MockCGMSensorLifecycleTests {
 
     @Test func lifecycleEventsRecordSourceAcceptanceAndConnection() throws {
         // Stop with nothing running: rejected, from the collector, no subscriber.
-        #expect(cgmcp(.stopSession) == .opCodeNotSupported)
+        #expect(try cgmcp(.stopSession) == .opCodeNotSupported)
         var event = try #require(sensor.lifecycleEvents.last)
         #expect(event.kind == .sessionStopped && event.source == .collector && !event.accepted && !event.collectorSubscribed)
 
         server.subscribed.insert(CGMCharacteristicUUID.measurement.cbUUID)
-        #expect(cgmcp(.startSession) == .success)
+        #expect(try cgmcp(.startSession) == .success)
         event = try #require(sensor.lifecycleEvents.last)
         #expect(event.kind == .sessionStarted && event.source == .collector && event.accepted && event.collectorSubscribed)
 
@@ -213,8 +215,33 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.takeMeasurement() == nil)
         #expect(sensor.sessionState == .stopped)
         #expect(sensor.sensorStatus.contains(.sessionStopped))
+        // The collector hears about it at once, from Measure Now as from a cadence tick.
+        #expect(sensor.lastStatusRecord?.sensorStatus.contains(.sessionStopped) == true)
         let event = try #require(sensor.lifecycleEvents.last)
         #expect(event.kind == .sessionExpired && event.source == .sensor && event.timeOffset == 60)
+    }
+
+    /// Real timers: the first reading goes out when the warm-up ends and the cadence counts from there, so a
+    /// warm-up on a 5 min cadence reads at 1:00, 6:00, 11:00. With no warm-up it goes out at Start Session.
+    @Test @MainActor func cadenceStartsAtWarmupEnd() {
+        let server = MockGATTService()
+        let queue = MockMessageQueue(gattServer: server)
+        let sensor = MockCGMSensor(gattServer: server, messageQueue: queue)
+        sensor.trace = .constant(mgdl: 100)
+        sensor.measurementInterval = 1
+        sensor.warmupDuration = 0.1
+        sensor.startSession()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        #expect(sensor.measurementCount == 0)   // still warming up
+        RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+        #expect(sensor.measurementCount == 1)   // the warm-up-end reading
+        let next = sensor.nextMeasurementDate.map { $0.timeIntervalSinceNow } ?? 0
+        #expect(next > 0.7 && next <= 1.0, "next reading should be one interval after the warm-up end, got \(next)")
+
+        sensor.warmupDuration = 0
+        sensor.startSession()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        #expect(sensor.measurementCount == 1)
     }
 
     @Test func replaceNotifiesTheDelegateOnce() {

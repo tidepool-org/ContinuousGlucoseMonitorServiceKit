@@ -95,11 +95,6 @@ struct MockCGMSensorRecordTests {
     let startedAt = Date(timeIntervalSince1970: 1_790_000_000)
     private let box: ClockBox
 
-    final class ClockBox: @unchecked Sendable {
-        var now: Date
-        init(_ now: Date) { self.now = now }
-    }
-
     init() {
         queue = MockMessageQueue(gattServer: server)
         let box = ClockBox(startedAt)
