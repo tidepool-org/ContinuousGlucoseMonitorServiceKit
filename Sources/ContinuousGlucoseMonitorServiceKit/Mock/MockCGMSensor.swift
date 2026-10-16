@@ -26,6 +26,18 @@ public final class MockCGMSensor: @unchecked Sendable {
     let messageQueue: MessagingQueue
     private let now: () -> Date
 
+    /// Tester-set skew of the sensor's clock against the host (HYD-C-015/016). Captured when a session starts:
+    /// Session Start Time is written in sensor time (host + skew) while the session itself keeps running on
+    /// the host clock, so a collector that trusts the start time timestamps the whole session off by this
+    /// much. A real sensor's clock does not jump mid-session, so a change here waits for the next Start
+    /// Session (Nate, 2026-10-16).
+    public var clockOffset: TimeInterval = 0 {
+        didSet {
+            guard oldValue != clockOffset else { return }
+            notifyDelegate()
+        }
+    }
+
     public weak var delegate: MockCGMSensorDelegate?
 
     /// CGMS requires authenticated links for every characteristic; `true` makes iOS pair and bond. Off by
@@ -103,6 +115,17 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// Position in a scripted scenario; advances once per measurement.
     private var scenarioIndex = 0
+
+    /// Noise, outliers and failed samples on top of the trace (CGM-DESIGN §Glucose trace). A new seed
+    /// restarts the stream at once; Start Session restarts it anyway so a session replays identically.
+    public var traceEffects: CGMTraceEffects = .none {
+        didSet {
+            guard oldValue != traceEffects else { return }
+            if oldValue.seed != traceEffects.seed { effectsGenerator = CGMSeededGenerator(seed: traceEffects.seed) }
+            notifyDelegate()
+        }
+    }
+    private var effectsGenerator = CGMSeededGenerator(seed: CGMTraceEffects.none.seed)
 
     // MARK: Record database (CGMS §3.6)
 
@@ -427,7 +450,8 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// What a read of 0x2AAA returns; before the first session it falls back to the power-on time.
     public var effectiveSessionStartTime: CGMSessionStartTime {
-        sessionStartTime ?? CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
+        // Before any session the fallback is power-on, in sensor time like a real start would be.
+        sessionStartTime ?? CGMSessionStartTime(date: sessionStartedAt.addingTimeInterval(clockOffset), timeZone: .current)
     }
 
     // MARK: - Session control (tester UI and CGMCP)
@@ -444,11 +468,13 @@ public final class MockCGMSensor: @unchecked Sendable {
         batchingDelegateUpdates {
             sessionStartedAt = now()
             sessionStoppedAt = nil
-            sessionStartTime = CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
+            // The one place the clock skew shows: the start time the collector reads is in sensor time.
+            sessionStartTime = CGMSessionStartTime(date: sessionStartedAt.addingTimeInterval(clockOffset), timeZone: .current)
             sessionStartTimeSetByCollector = false
             lastMeasurement = nil
             measurementCount = 0
             scenarioIndex = 0
+            effectsGenerator = CGMSeededGenerator(seed: traceEffects.seed)   // HYD-C-018: same session, same noise
             recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
             racpReportQueued = false
             calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
@@ -643,7 +669,10 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// scenario value when the source is scripted.
     private func makeRecord(elapsed: TimeInterval, timeOffset: UInt16) -> CGMMeasurementRecord {
         let index = scenarioIndex
-        var glucose = trace.glucose(elapsed: elapsed, index: index).rounded()
+        // HYD-C-018: the effects draw from the seeded stream on every reading, inert or not, so the stream
+        // stays aligned with the reading count and a session replays identically.
+        let sample = traceEffects.apply(to: trace.glucose(elapsed: elapsed, index: index), using: &effectsGenerator)
+        var glucose = sample?.rounded() ?? .nan
         var trend = feature.flags.contains(.trendInformation) ? (trace.trend(elapsed: elapsed, index: index) * 10).rounded() / 10 : nil
         var quality: Double? = feature.flags.contains(.quality) ? 100 : nil
 
@@ -653,12 +682,21 @@ public final class MockCGMSensor: @unchecked Sendable {
             glucose = .nan
             trend = nil
             quality = quality.map { _ in 0 }
+        } else if sample == nil {
+            // A failed sample from the trace effects: no value and no confidence, but no fault bit either,
+            // since the sensor itself is fine and the next reading will be normal.
+            trend = nil
+            quality = quality.map { _ in 0 }
         } else {
             (glucose, rangeStatus) = clampedToSensorRange(glucose)
         }
 
         // §3.7.2.3–3.7.2.6: the reading is compared against the alert levels and the record carries the result.
-        alertStatus = alertLevels.annunciation(glucose: glucose, trend: trend, feature: feature.flags)
+        // A failed sample on a healthy sensor has nothing to compare, so the previous verdict stands rather
+        // than the alert bits flickering off for one interval; an impaired sensor does clear them.
+        if sample != nil || condition != .healthy {
+            alertStatus = alertLevels.annunciation(glucose: glucose, trend: trend, feature: feature.flags)
+        }
         let record = CGMMeasurementRecord(
             glucoseConcentration: glucose,
             timeOffset: timeOffset,
@@ -673,7 +711,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// One CGM Measurement notification carrying `records` back to back (CGMS §3.1: a value may hold
     /// several records). Plain path only when the collector subscribed; the secure path checks AC Data Out.
     private func notifyMeasurements(_ records: [CGMMeasurementRecord]) {
-        let value = records.reduce(into: Data()) { $0.append($1.encoded(e2eCRC: isE2EProtectionSupported)) }
+        let value = faulted(records.reduce(into: Data()) { $0.append($1.encoded(e2eCRC: isE2EProtectionSupported)) }, on: .measurement)
         if isAuthorizationControlEnabled {
             authorizationDataCharacteristic.sendSecureNotification(value, to: CGMResourceHandle.handle(for: .measurement))
         } else if gattServer.isCharacteristicSubscribed(CGMCharacteristicUUID.measurement.cbUUID) == true {
@@ -741,27 +779,27 @@ public final class MockCGMSensor: @unchecked Sendable {
     // MARK: - Read handlers
 
     public func readFeature() -> (CBATTError.Code, Data) {
-        let data = feature.encoded()
+        let data = faulted(feature.encoded(), on: .feature)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(feature))")
         return (.success, data)
     }
 
     public func readStatus() -> (CBATTError.Code, Data) {
         let status = self.status
-        let data = status.encoded(e2eCRC: isE2EProtectionSupported)
+        let data = faulted(status.encoded(e2eCRC: isE2EProtectionSupported), on: .status)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(status))")
         return (.success, data)
     }
 
     public func readSessionStartTime() -> (CBATTError.Code, Data) {
         let startTime = effectiveSessionStartTime
-        let data = startTime.encoded(e2eCRC: isE2EProtectionSupported)
+        let data = faulted(startTime.encoded(e2eCRC: isE2EProtectionSupported), on: .sessionStartTime)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(startTime))")
         return (.success, data)
     }
 
     public func readSessionRunTime() -> (CBATTError.Code, Data) {
-        let data = sessionRunTime.encoded(e2eCRC: isE2EProtectionSupported)
+        let data = faulted(sessionRunTime.encoded(e2eCRC: isE2EProtectionSupported), on: .sessionRunTime)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(sessionRunTime))")
         return (.success, data)
     }
@@ -1003,8 +1041,38 @@ public final class MockCGMSensor: @unchecked Sendable {
         return data.isCRCValid ? .ok : .invalidCRC
     }
 
+    // MARK: - Integrity fault (HYD-C-009)
+
+    /// Armed by the tester; the next read response, notification or indication of a CGMS characteristic goes
+    /// out corrupted this way, then the fault clears. See `CGMIntegrityFault`.
+    public var pendingIntegrityFault: CGMIntegrityFault? {
+        didSet {
+            guard oldValue != pendingIntegrityFault else { return }
+            notifyDelegate()
+        }
+    }
+
+    /// What the last armed fault did.
+    public private(set) var lastInjectedFault: CGMInjectedFault?
+
+    /// `data` after the pending fault, if any, which is consumed here. RACP carries no CRC in CGMS, so the
+    /// CRC faults pass its payloads through untouched and stay armed for the next message that has one.
+    private func faulted(_ data: Data, on characteristic: CGMCharacteristicUUID) -> Data {
+        guard let fault = pendingIntegrityFault else { return data }
+        let hasCRC = isE2EProtectionSupported && characteristic != .recordAccessControlPoint
+        let result = fault.applied(to: data, hasCRC: hasCRC)
+        let applied = result != data
+        if characteristic == .recordAccessControlPoint, !applied { return data }
+        pendingIntegrityFault = nil
+        lastInjectedFault = CGMInjectedFault(fault: fault, characteristic: characteristic, date: now(), applied: applied)
+        ConsoleOut.shared.logMessage(message: "integrity fault \(fault) on \(characteristic.name): \(applied ? "\(data.hexadecimalString) → \(result.hexadecimalString)" : "nothing to corrupt, sent intact")")
+        notifyDelegate()
+        return result
+    }
+
     /// Plain indication, or an encrypted one on AC Data Out Indicate while Authorization Control is on.
     private func indicate(_ response: Data, on characteristic: CGMCharacteristicUUID) {
+        let response = faulted(response, on: characteristic)
         ConsoleOut.shared.logMessage(message: "\(#function) \(characteristic.name): \(response.hexadecimalString)")
         if isAuthorizationControlEnabled {
             authorizationDataCharacteristic.sendSecureIndication(response, to: CGMResourceHandle.handle(for: characteristic))

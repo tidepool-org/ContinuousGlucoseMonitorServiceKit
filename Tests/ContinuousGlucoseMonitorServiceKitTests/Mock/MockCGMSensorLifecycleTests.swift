@@ -251,6 +251,35 @@ struct MockCGMSensorLifecycleTests {
         #expect(afterEdit > 0.9 && afterEdit <= 1.0, "cadence should restart from the edit, got \(afterEdit)")
     }
 
+    // MARK: Device clock (HYD-C-015/016)
+
+    /// The skew is captured at Start Session and shows only in Session Start Time; Time Offset, warm-up and
+    /// the lifecycle log run on the host clock, and a mid-session change waits for the next session.
+    @Test func clockOffsetSkewsOnlyTheSessionStartTime() throws {
+        #expect(sensor.effectiveSessionStartTime.date == startedAt)   // power-on fallback, no skew yet
+        sensor.clockOffset = 10 * 60
+        #expect(sensor.effectiveSessionStartTime.date == startedAt.addingTimeInterval(10 * 60))
+        sensor.startSession()
+        #expect(try #require(sensor.sessionStartTime).date == startedAt.addingTimeInterval(10 * 60))
+        #expect(sensor.timeOffset == 0)
+        #expect(sensor.lifecycleEvents.last?.date == startedAt)
+
+        box.now = startedAt.addingTimeInterval(5 * 60)
+        #expect(sensor.timeOffset == 5)
+        sensor.clockOffset = 30 * 60   // nothing moves until the next session
+        #expect(sensor.timeOffset == 5)
+        #expect(try #require(sensor.sessionStartTime).date == startedAt.addingTimeInterval(10 * 60))
+
+        // A skew behind the host does not disturb the warm-up or the cadence, which are host-clock matters.
+        sensor.warmupDuration = 60
+        sensor.clockOffset = -60 * 60
+        sensor.startSession()
+        #expect(try #require(sensor.sessionStartTime).date == box.now.addingTimeInterval(-60 * 60))
+        #expect(sensor.isWarmingUp)
+        #expect(sensor.warmupEndDate == box.now.addingTimeInterval(60))
+        #expect(sensor.timeOffset == 0)
+    }
+
     @Test func replaceNotifiesTheDelegateOnce() {
         let spy = DelegateSpy()
         sensor.delegate = spy
