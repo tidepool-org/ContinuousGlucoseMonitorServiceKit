@@ -711,7 +711,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// One CGM Measurement notification carrying `records` back to back (CGMS §3.1: a value may hold
     /// several records). Plain path only when the collector subscribed; the secure path checks AC Data Out.
     private func notifyMeasurements(_ records: [CGMMeasurementRecord]) {
-        let value = records.reduce(into: Data()) { $0.append($1.encoded(e2eCRC: isE2EProtectionSupported)) }
+        let value = faulted(records.reduce(into: Data()) { $0.append($1.encoded(e2eCRC: isE2EProtectionSupported)) }, on: .measurement)
         if isAuthorizationControlEnabled {
             authorizationDataCharacteristic.sendSecureNotification(value, to: CGMResourceHandle.handle(for: .measurement))
         } else if gattServer.isCharacteristicSubscribed(CGMCharacteristicUUID.measurement.cbUUID) == true {
@@ -779,27 +779,27 @@ public final class MockCGMSensor: @unchecked Sendable {
     // MARK: - Read handlers
 
     public func readFeature() -> (CBATTError.Code, Data) {
-        let data = feature.encoded()
+        let data = faulted(feature.encoded(), on: .feature)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(feature))")
         return (.success, data)
     }
 
     public func readStatus() -> (CBATTError.Code, Data) {
         let status = self.status
-        let data = status.encoded(e2eCRC: isE2EProtectionSupported)
+        let data = faulted(status.encoded(e2eCRC: isE2EProtectionSupported), on: .status)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(status))")
         return (.success, data)
     }
 
     public func readSessionStartTime() -> (CBATTError.Code, Data) {
         let startTime = effectiveSessionStartTime
-        let data = startTime.encoded(e2eCRC: isE2EProtectionSupported)
+        let data = faulted(startTime.encoded(e2eCRC: isE2EProtectionSupported), on: .sessionStartTime)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(startTime))")
         return (.success, data)
     }
 
     public func readSessionRunTime() -> (CBATTError.Code, Data) {
-        let data = sessionRunTime.encoded(e2eCRC: isE2EProtectionSupported)
+        let data = faulted(sessionRunTime.encoded(e2eCRC: isE2EProtectionSupported), on: .sessionRunTime)
         ConsoleOut.shared.logMessage(message: "\(#function): \(data.hexadecimalString) (\(sessionRunTime))")
         return (.success, data)
     }
@@ -1041,8 +1041,38 @@ public final class MockCGMSensor: @unchecked Sendable {
         return data.isCRCValid ? .ok : .invalidCRC
     }
 
+    // MARK: - Integrity fault (HYD-C-009)
+
+    /// Armed by the tester; the next read response, notification or indication of a CGMS characteristic goes
+    /// out corrupted this way, then the fault clears. See `CGMIntegrityFault`.
+    public var pendingIntegrityFault: CGMIntegrityFault? {
+        didSet {
+            guard oldValue != pendingIntegrityFault else { return }
+            notifyDelegate()
+        }
+    }
+
+    /// What the last armed fault did.
+    public private(set) var lastInjectedFault: CGMInjectedFault?
+
+    /// `data` after the pending fault, if any, which is consumed here. RACP carries no CRC in CGMS, so the
+    /// CRC faults pass its payloads through untouched and stay armed for the next message that has one.
+    private func faulted(_ data: Data, on characteristic: CGMCharacteristicUUID) -> Data {
+        guard let fault = pendingIntegrityFault else { return data }
+        let hasCRC = isE2EProtectionSupported && characteristic != .recordAccessControlPoint
+        let result = fault.applied(to: data, hasCRC: hasCRC)
+        let applied = result != data
+        if characteristic == .recordAccessControlPoint, !applied { return data }
+        pendingIntegrityFault = nil
+        lastInjectedFault = CGMInjectedFault(fault: fault, characteristic: characteristic, date: now(), applied: applied)
+        ConsoleOut.shared.logMessage(message: "integrity fault \(fault) on \(characteristic.name): \(applied ? "\(data.hexadecimalString) → \(result.hexadecimalString)" : "nothing to corrupt, sent intact")")
+        notifyDelegate()
+        return result
+    }
+
     /// Plain indication, or an encrypted one on AC Data Out Indicate while Authorization Control is on.
     private func indicate(_ response: Data, on characteristic: CGMCharacteristicUUID) {
+        let response = faulted(response, on: characteristic)
         ConsoleOut.shared.logMessage(message: "\(#function) \(characteristic.name): \(response.hexadecimalString)")
         if isAuthorizationControlEnabled {
             authorizationDataCharacteristic.sendSecureIndication(response, to: CGMResourceHandle.handle(for: characteristic))
