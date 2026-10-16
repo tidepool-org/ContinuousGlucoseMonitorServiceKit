@@ -24,22 +24,18 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     let gattServer: GATTService
     let messageQueue: MessagingQueue
-    private let hostNow: () -> Date
+    private let now: () -> Date
 
-    /// Tester-set skew of the device clock against the host (HYD-C-015). Session Start Time is reported in
-    /// device time, so a collector that trusts it timestamps readings off by this much; Time Offset counts in
-    /// device time too, so changing the skew mid-session moves it. Lifecycle events keep host time.
+    /// Tester-set skew of the sensor's clock against the host (HYD-C-015/016). Captured when a session starts:
+    /// Session Start Time is written in sensor time (host + skew) while the session itself keeps running on
+    /// the host clock, so a collector that trusts the start time timestamps the whole session off by this
+    /// much. A real sensor's clock does not jump mid-session, so a change here waits for the next Start
+    /// Session (Nate, 2026-10-16).
     public var clockOffset: TimeInterval = 0 {
         didSet {
             guard oldValue != clockOffset else { return }
             notifyDelegate()
         }
-    }
-
-    /// The device clock (HYD-C-016): the host clock plus `clockOffset`. Everything the collector can see
-    /// (Session Start Time, Time Offset, warm-up) is measured on this clock.
-    public func now() -> Date {
-        hostNow().addingTimeInterval(clockOffset)
     }
 
     public weak var delegate: MockCGMSensorDelegate?
@@ -377,7 +373,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         self.requiresEncryption = requiresEncryption
         self.deviceInformation = deviceInformation
         self.feature = feature
-        self.hostNow = now
+        self.now = now
         // A sensor powers on idle; Start Session comes from the tester UI or the collector (CGMS §3.7.2.8).
         self.sessionState = .notStarted
         self.sessionStartedAt = now()
@@ -454,7 +450,8 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// What a read of 0x2AAA returns; before the first session it falls back to the power-on time.
     public var effectiveSessionStartTime: CGMSessionStartTime {
-        sessionStartTime ?? CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
+        // Before any session the fallback is power-on, in sensor time like a real start would be.
+        sessionStartTime ?? CGMSessionStartTime(date: sessionStartedAt.addingTimeInterval(clockOffset), timeZone: .current)
     }
 
     // MARK: - Session control (tester UI and CGMCP)
@@ -471,7 +468,8 @@ public final class MockCGMSensor: @unchecked Sendable {
         batchingDelegateUpdates {
             sessionStartedAt = now()
             sessionStoppedAt = nil
-            sessionStartTime = CGMSessionStartTime(date: sessionStartedAt, timeZone: .current)
+            // The one place the clock skew shows: the start time the collector reads is in sensor time.
+            sessionStartTime = CGMSessionStartTime(date: sessionStartedAt.addingTimeInterval(clockOffset), timeZone: .current)
             sessionStartTimeSetByCollector = false
             lastMeasurement = nil
             measurementCount = 0
@@ -559,7 +557,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     }
 
     private func recordLifecycle(_ kind: CGMLifecycleEvent.Kind, source: CGMLifecycleEvent.Source, accepted: Bool = true, note: String? = nil) {
-        let event = CGMLifecycleEvent(date: hostNow(), kind: kind, source: source, accepted: accepted, collectorSubscribed: isMeasurementNotificationConfigured, timeOffset: timeOffset, note: note)
+        let event = CGMLifecycleEvent(date: now(), kind: kind, source: source, accepted: accepted, collectorSubscribed: isMeasurementNotificationConfigured, timeOffset: timeOffset, note: note)
         lifecycleEvents.append(event)
         if lifecycleEvents.count > Self.lifecycleEventLimit {
             lifecycleEvents.removeFirst(lifecycleEvents.count - Self.lifecycleEventLimit)
@@ -694,7 +692,11 @@ public final class MockCGMSensor: @unchecked Sendable {
         }
 
         // §3.7.2.3–3.7.2.6: the reading is compared against the alert levels and the record carries the result.
-        alertStatus = alertLevels.annunciation(glucose: glucose, trend: trend, feature: feature.flags)
+        // A failed sample on a healthy sensor has nothing to compare, so the previous verdict stands rather
+        // than the alert bits flickering off for one interval; an impaired sensor does clear them.
+        if sample != nil || condition != .healthy {
+            alertStatus = alertLevels.annunciation(glucose: glucose, trend: trend, feature: feature.flags)
+        }
         let record = CGMMeasurementRecord(
             glucoseConcentration: glucose,
             timeOffset: timeOffset,

@@ -65,11 +65,35 @@ struct CGMTraceEffectsTests {
         #expect((0..<200).compactMap { _ in wild.apply(to: 50, using: &wildGenerator) }.allSatisfy { $0 >= 0 })
     }
 
-    @Test func probabilitiesAreClampedToUnitRange() {
-        let effects = CGMTraceEffects(noiseStandardDeviation: -5, outlierProbability: 7, errorProbability: -1)
+    /// Fractional probabilities land near their nominal rate over a fixed-seed run, which also pins the order
+    /// of the draws: swapping the failure and outlier draws would move both counts.
+    @Test func fractionalProbabilitiesHitTheirRates() {
+        let effects = CGMTraceEffects(outlierProbability: 0.25, outlierMagnitude: 60, errorProbability: 0.1, seed: 21)
+        var generator = CGMSeededGenerator(seed: effects.seed)
+        let results = (0..<2000).map { _ in effects.apply(to: 120, using: &generator) }
+        let failures = results.filter { $0 == nil }.count
+        let outliers = results.compactMap { $0 }.filter { abs($0 - 120) == 60 }.count
+        #expect((150...250).contains(failures), "expected about 200 failures, got \(failures)")
+        let survivors = results.count - failures
+        #expect(Double(outliers) / Double(survivors) > 0.2 && Double(outliers) / Double(survivors) < 0.3)
+    }
+
+    /// The initialiser and `apply` both sanitise, so a setter or decoder cannot smuggle in a bad value.
+    @Test func settingsAreSanitisedOnTheWayInAndOnUse() {
+        let effects = CGMTraceEffects(noiseStandardDeviation: -5, outlierProbability: 7, outlierMagnitude: -60, errorProbability: -1)
         #expect(effects.noiseStandardDeviation == 0)
         #expect(effects.outlierProbability == 1)
+        #expect(effects.outlierMagnitude == 0)
         #expect(effects.errorProbability == 0)
+
+        var unchecked = CGMTraceEffects.none
+        unchecked.noiseStandardDeviation = .infinity
+        unchecked.outlierMagnitude = .nan
+        unchecked.outlierProbability = .infinity
+        unchecked.errorProbability = .nan
+        #expect(!unchecked.isActive)
+        var generator = CGMSeededGenerator(seed: 1)
+        #expect(unchecked.apply(to: 120, using: &generator) == 120)
     }
 
     // MARK: On the sensor
@@ -82,43 +106,59 @@ struct CGMTraceEffectsTests {
         return (sensor, queue)
     }
 
-    /// Two sensors with the same seed produce the same readings, and a new session replays them.
+    /// Glucose values compared NaN-safely: two failed readings are the same reading.
+    private func sameReadings(_ a: [Double], _ b: [Double]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { ($0.isNaN && $1.isNaN) || $0 == $1 }
+    }
+
+    /// Two sensors with the same seed produce the same readings, failures included, and a new session
+    /// replays them.
     @Test func sessionsReplayIdenticallyFromTheSeed() throws {
-        let effects = CGMTraceEffects(noiseStandardDeviation: 15, outlierProbability: 0.2, seed: 11)
+        let effects = CGMTraceEffects(noiseStandardDeviation: 15, outlierProbability: 0.2, errorProbability: 0.2, seed: 11)
         let (first, _) = makeSensor()
         let (second, _) = makeSensor()
         first.traceEffects = effects
         second.traceEffects = effects
         first.startSession()
         second.startSession()
-        let fromFirst = (0..<6).map { _ in first.takeMeasurement()?.glucoseConcentration }
-        let fromSecond = (0..<6).map { _ in second.takeMeasurement()?.glucoseConcentration }
-        #expect(fromFirst == fromSecond)
-        #expect(Set(fromFirst.compactMap { $0 }).count > 1)   // the noise did something
+        let fromFirst = (0..<12).map { _ in first.takeMeasurement()!.glucoseConcentration }
+        let fromSecond = (0..<12).map { _ in second.takeMeasurement()!.glucoseConcentration }
+        #expect(sameReadings(fromFirst, fromSecond))
+        #expect(Set(fromFirst.filter { $0.isFinite }).count > 1)   // the noise did something
+        #expect(fromFirst.contains { $0.isNaN })                     // and so did the failures
 
         first.startSession()
-        let replayed = (0..<6).map { _ in first.takeMeasurement()?.glucoseConcentration }
-        #expect(replayed == fromFirst)
+        let replayed = (0..<12).map { _ in first.takeMeasurement()!.glucoseConcentration }
+        #expect(sameReadings(replayed, fromFirst))
 
         // A different seed is a different session.
         second.traceEffects.seed = 12
         second.startSession()
-        #expect((0..<6).map { _ in second.takeMeasurement()?.glucoseConcentration } != fromFirst)
+        #expect(!sameReadings((0..<12).map { _ in second.takeMeasurement()!.glucoseConcentration }, fromFirst))
     }
 
-    /// A failed sample is a record without a value or confidence, and no fault bit.
+    /// A failed sample is a record without a value or confidence, and no fault bit; the alert bits from the
+    /// last real reading stay put instead of flickering off for one interval.
     @Test func failedSampleIsReportedWithoutAValueOrAFaultBit() throws {
         let (sensor, _) = makeSensor()
-        sensor.traceEffects = CGMTraceEffects(errorProbability: 1)
+        sensor.feature.flags.insert(.patientHighLowAlerts)
+        sensor.trace = .constant(mgdl: 300)   // above the default patient high of 250
         sensor.startSession()
+        #expect(sensor.takeMeasurement()?.sensorStatus.contains(.resultHigherThanPatientHigh) == true)
+
+        sensor.traceEffects = CGMTraceEffects(errorProbability: 1)
         let record = try #require(sensor.takeMeasurement())
         #expect(record.glucoseConcentration.isNaN)
         #expect(record.trend == nil)
         #expect(record.quality == 0)
         #expect(record.sensorStatus.isDisjoint(with: [.generalDeviceFault, .sensorMalfunction]))
-        #expect(sensor.alertStatus == [])
+        #expect(record.sensorStatus.contains(.resultHigherThanPatientHigh))
+        #expect(sensor.alertStatus.contains(.resultHigherThanPatientHigh))
 
         sensor.traceEffects = .none
-        #expect(sensor.takeMeasurement()?.glucoseConcentration == 120)
+        sensor.trace = .constant(mgdl: 120)
+        let recovered = try #require(sensor.takeMeasurement())
+        #expect(recovered.glucoseConcentration == 120)
+        #expect(sensor.alertStatus == [])
     }
 }

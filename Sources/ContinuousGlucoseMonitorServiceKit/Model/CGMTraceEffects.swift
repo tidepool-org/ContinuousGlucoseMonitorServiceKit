@@ -31,29 +31,44 @@ public struct CGMTraceEffects: Equatable, Codable, Sendable {
                 errorProbability: Double = 0,
                 seed: UInt64 = 1)
     {
-        self.noiseStandardDeviation = max(0, noiseStandardDeviation)
-        self.outlierProbability = min(max(0, outlierProbability), 1)
-        self.outlierMagnitude = outlierMagnitude
-        self.errorProbability = min(max(0, errorProbability), 1)
+        self.noiseStandardDeviation = Self.finiteNonNegative(noiseStandardDeviation)
+        self.outlierProbability = Self.unit(outlierProbability)
+        self.outlierMagnitude = Self.finiteNonNegative(outlierMagnitude)
+        self.errorProbability = Self.unit(errorProbability)
         self.seed = seed
     }
 
     /// False when every setting is inert and readings pass through unchanged.
     public var isActive: Bool {
-        noiseStandardDeviation > 0 || outlierProbability > 0 || errorProbability > 0
+        Self.finiteNonNegative(noiseStandardDeviation) > 0 || Self.unit(outlierProbability) > 0 || Self.unit(errorProbability) > 0
     }
 
     /// One reading after the effects; nil when the reading fails. Always consumes the same number of draws
-    /// (five), so the position in the stream depends only on how many readings were taken.
+    /// (five), so the position in the stream depends only on how many readings were taken. The settings are
+    /// sanitised here as well as in `init`, since the properties and `Decodable` can bypass the initialiser.
     public func apply(to glucose: Double, using generator: inout CGMSeededGenerator) -> Double? {
-        let failed = generator.nextUnit() < errorProbability
-        let isOutlier = generator.nextUnit() < outlierProbability
+        let failed = generator.nextUnit() < Self.unit(errorProbability)
+        let isOutlier = generator.nextUnit() < Self.unit(outlierProbability)
         let outlierUp = generator.nextUnit() < 0.5
-        let noise = generator.nextGaussian() * noiseStandardDeviation
-        if failed || !glucose.isFinite { return failed ? nil : glucose }
+        let noise = generator.nextGaussian() * Self.finiteNonNegative(noiseStandardDeviation)
+        if failed { return nil }
+        guard glucose.isFinite else { return glucose }
         var value = glucose + noise
-        if isOutlier { value += outlierUp ? outlierMagnitude : -outlierMagnitude }
+        if isOutlier {
+            let magnitude = Self.finiteNonNegative(outlierMagnitude)
+            value += outlierUp ? magnitude : -magnitude
+        }
         return max(0, value)
+    }
+
+    /// A probability: NaN and infinities count as 0, everything else is clamped to 0...1.
+    private static func unit(_ probability: Double) -> Double {
+        probability.isFinite ? min(max(probability, 0), 1) : 0
+    }
+
+    /// A magnitude in mg/dL: NaN, infinities and negatives count as 0.
+    private static func finiteNonNegative(_ value: Double) -> Double {
+        value.isFinite ? max(value, 0) : 0
     }
 }
 

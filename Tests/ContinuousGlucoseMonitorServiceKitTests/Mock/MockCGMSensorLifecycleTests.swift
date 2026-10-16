@@ -253,21 +253,30 @@ struct MockCGMSensorLifecycleTests {
 
     // MARK: Device clock (HYD-C-015/016)
 
-    /// The device clock is the host clock plus the tester's offset: Session Start Time and Time Offset follow
-    /// it, the lifecycle log keeps host time, and a mid-session change moves Time Offset.
-    @Test func clockOffsetSkewsWhatTheCollectorSees() throws {
+    /// The skew is captured at Start Session and shows only in Session Start Time; Time Offset, warm-up and
+    /// the lifecycle log run on the host clock, and a mid-session change waits for the next session.
+    @Test func clockOffsetSkewsOnlyTheSessionStartTime() throws {
+        #expect(sensor.effectiveSessionStartTime.date == startedAt)   // power-on fallback, no skew yet
         sensor.clockOffset = 10 * 60
+        #expect(sensor.effectiveSessionStartTime.date == startedAt.addingTimeInterval(10 * 60))
         sensor.startSession()
-        #expect(sensor.now() == startedAt.addingTimeInterval(10 * 60))
         #expect(try #require(sensor.sessionStartTime).date == startedAt.addingTimeInterval(10 * 60))
         #expect(sensor.timeOffset == 0)
         #expect(sensor.lifecycleEvents.last?.date == startedAt)
 
         box.now = startedAt.addingTimeInterval(5 * 60)
         #expect(sensor.timeOffset == 5)
-        sensor.clockOffset = 30 * 60   // the device clock jumps 20 min ahead
-        #expect(sensor.timeOffset == 25)
-        sensor.clockOffset = -60 * 60  // and back before the session started: never negative
+        sensor.clockOffset = 30 * 60   // nothing moves until the next session
+        #expect(sensor.timeOffset == 5)
+        #expect(try #require(sensor.sessionStartTime).date == startedAt.addingTimeInterval(10 * 60))
+
+        // A skew behind the host does not disturb the warm-up or the cadence, which are host-clock matters.
+        sensor.warmupDuration = 60
+        sensor.clockOffset = -60 * 60
+        sensor.startSession()
+        #expect(try #require(sensor.sessionStartTime).date == box.now.addingTimeInterval(-60 * 60))
+        #expect(sensor.isWarmingUp)
+        #expect(sensor.warmupEndDate == box.now.addingTimeInterval(60))
         #expect(sensor.timeOffset == 0)
     }
 
