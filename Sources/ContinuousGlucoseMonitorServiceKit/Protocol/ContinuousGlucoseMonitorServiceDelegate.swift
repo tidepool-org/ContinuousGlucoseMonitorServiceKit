@@ -34,6 +34,8 @@ public protocol CGMSensorDelegate: AnyObject {
     func sensorIsReady(_ sensor: CGMSensorComms)
     /// The ACS key exchange finished, or the secure session was lost (`error` set).
     func sensorDidCompleteAuthentication(_ sensor: CGMSensorComms, error: DeviceCommError?)
+    /// `usesSecureChannel` changed by itself: the sensor flipped protection (AC Status) or a key came or went.
+    func sensorDidUpdateSecurity(_ sensor: CGMSensorComms)
     /// Every CGM Measurement notification, periodic or from an RACP report; one notification may carry
     /// several records.
     func sensor(_ sensor: CGMSensorComms, didReceiveMeasurements records: [CGMMeasurementRecord])
@@ -51,6 +53,7 @@ public protocol CGMSensorDelegate: AnyObject {
 
 public extension CGMSensorDelegate {
     func sensorIsReady(_ sensor: CGMSensorComms) { }
+    func sensorDidUpdateSecurity(_ sensor: CGMSensorComms) { }
     func sensor(_ sensor: CGMSensorComms, didUpdateFeature feature: CGMFeature) { }
     func sensor(_ sensor: CGMSensorComms, didReceiveSpecificOpsResponse response: CGMSpecificOpsResponse) { }
     func sensor(_ sensor: CGMSensorComms, didReceiveRACPResponse response: CGMRACPResponse) { }
@@ -76,8 +79,11 @@ public protocol CGMSensorComms: AnyObject {
     /// True when no ACS is required or the key exchange has completed.
     var isAuthenticated: Bool { get }
     var isSecurityEstablished: Bool { get }
-    /// Route CGMS reads and writes through AC Data In/Out. Set when a key exchange succeeds; a tester can
-    /// clear it to watch the sensor refuse plain access.
+    /// From AC Status: whether the sensor currently gates its CGMS characteristics behind ACS. False until read.
+    var areResourcesProtected: Bool { get }
+    /// Route CGMS reads and writes through AC Data In/Out. Set by the service when the sensor protects its
+    /// resources and a key exchange has succeeded (AC Data In refuses requests otherwise); a tester can flip it
+    /// by hand to watch the sensor refuse the other path.
     var usesSecureChannel: Bool { get set }
 
     // MARK: Connection

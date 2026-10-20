@@ -26,10 +26,12 @@ struct ContinuousGlucoseMonitorServiceTests {
         var connectionChanges = 0
         var stateUpdates = 0
         var authentications: [DeviceCommError?] = []
+        var securityUpdates = 0
 
         func sensor(_ sensor: CGMSensorComms, didDiscoverSensorWithName name: String?, identifier: UUID, advertisementData: [String: Any], signalStrength: NSNumber) { }
         func sensorConnectionStatusChanged(_ sensor: CGMSensorComms) { connectionChanges += 1 }
         func sensorDidCompleteAuthentication(_ sensor: CGMSensorComms, error: DeviceCommError?) { authentications.append(error) }
+        func sensorDidUpdateSecurity(_ sensor: CGMSensorComms) { securityUpdates += 1 }
         func sensor(_ sensor: CGMSensorComms, didReceiveMeasurements records: [CGMMeasurementRecord]) { measurements.append(records) }
         func sensor(_ sensor: CGMSensorComms, didUpdateFeature feature: CGMFeature) { features.append(feature) }
         func sensor(_ sensor: CGMSensorComms, didReceiveSpecificOpsResponse response: CGMSpecificOpsResponse) { specificOpsResponses.append(response) }
@@ -60,6 +62,104 @@ struct ContinuousGlucoseMonitorServiceTests {
 
     private func receive(_ data: Data, on characteristic: CGMCharacteristicUUID) {
         service.bluetoothManager(bluetoothManager, peripheralManager: peripheralManager, didReceiveValue: data, fromCharactistic: characteristic.cbUUID)
+    }
+
+    /// AC Status as the sensor encodes it: flags octet (bit 0 controls enabled, bit 1 security established),
+    /// then the current restriction map ID (UInt16 little endian; 0 = resources open).
+    private func receiveACStatus(restrictionMapID: UInt16, established: Bool) {
+        var value = Data([established ? 0x03 : 0x01])
+        value.append(contentsOf: [UInt8(restrictionMapID & 0xFF), UInt8(restrictionMapID >> 8)])
+        service.bluetoothManager(bluetoothManager, peripheralManager: peripheralManager, didReceiveValue: value, fromCharactistic: ACCharacteristicUUID.status.cbUUID)
+    }
+
+    // MARK: Response timeouts
+
+    /// Completions handed to the service, collected from whichever queue answers them.
+    final class ResultBox {
+        var results: [DeviceCommResult<Data>] = []
+    }
+
+    /// A request whose answer never comes fails with Procedure Timeout and frees its characteristic, so the
+    /// next request is not refused as in progress. This is the safety net for refusals BluetoothCommonKit's
+    /// AC Data In send swallows.
+    @Test func unansweredRequestTimesOutAndFreesTheCharacteristic() async throws {
+        service.responseTimeout = 0.1
+        let uuid = CGMCharacteristicUUID.specificOpsControlPoint.cbUUID
+        let box = ResultBox()
+        #expect(service.setPending(uuid) { box.results.append($0) })
+        #expect(!service.setPending(uuid) { _ in })   // busy until answered or timed out
+
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(box.results == [.failure(.procedureTimeout)])
+        #expect(service.takePending(uuid) == nil)
+        #expect(service.setPending(uuid) { _ in })    // free again
+        _ = service.takePending(uuid)
+    }
+
+    /// The answer disarms the timer: one completion, never a late timeout on top.
+    @Test func answeredRequestDoesNotTimeOutLater() async throws {
+        service.responseTimeout = 0.1
+        let uuid = CGMCharacteristicUUID.specificOpsControlPoint.cbUUID
+        let box = ResultBox()
+        #expect(service.setPending(uuid) { box.results.append($0) })
+        receive(CGMSpecificOpsResponse.communicationInterval(minutes: 5).encoded(e2eCRC: false), on: .specificOpsControlPoint)
+        #expect(box.results.count == 1)
+
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(box.results.count == 1)
+    }
+
+    /// A Report Stored Records transfer can outlast any fixed wait, so each record restarts the RACP clock;
+    /// the request only times out once the records stop without a Response Code.
+    @Test func racpReportStaysPendingWhileRecordsArrive() async throws {
+        service.responseTimeout = 0.3
+        let uuid = CGMCharacteristicUUID.recordAccessControlPoint.cbUUID
+        let box = ResultBox()
+        #expect(service.setPending(uuid) { box.results.append($0) })
+        let record = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 1, sensorStatus: [], trend: nil, quality: nil)
+        for _ in 0..<5 {
+            try await Task.sleep(for: .milliseconds(150))
+            receive(record.encoded(e2eCRC: false), on: .measurement)
+        }
+        #expect(box.results.isEmpty)   // 750 ms in, still waiting thanks to the records
+
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(box.results == [.failure(.procedureTimeout)])
+    }
+
+    // MARK: Secure channel policy
+
+    /// AC Data In answers Request Not Supported while the restriction map ID is 0, so holding a key is not
+    /// enough: the channel follows protection, and follows it live when the sensor flips the toggle.
+    @Test func secureChannelFollowsProtectionAndTheKey() {
+        // Key, but the sensor serves CGMS plainly: stay plain.
+        service.sharedKeyData = Data([1, 2, 3])
+        receiveACStatus(restrictionMapID: 0, established: true)
+        #expect(service.isSecurityEstablished)
+        #expect(!service.areResourcesProtected)
+        #expect(!service.usesSecureChannel)
+        #expect(!service.state.isAuthorizationControlRequired)
+        #expect(spy.securityUpdates == 0)
+
+        // The tester turns Required on: the sensor indicates AC Status and the channel switches.
+        receiveACStatus(restrictionMapID: 1, established: true)
+        #expect(service.areResourcesProtected)
+        #expect(service.usesSecureChannel)
+        #expect(service.state.isAuthorizationControlRequired)
+        #expect(spy.securityUpdates == 1)
+
+        // Required off again: back to plain, reported once.
+        receiveACStatus(restrictionMapID: 0, established: true)
+        #expect(!service.usesSecureChannel)
+        #expect(spy.securityUpdates == 2)
+
+        // Protected but no key on this side: plain (and refused by the sensor) until an exchange completes.
+        service.sharedKeyData = nil
+        receiveACStatus(restrictionMapID: 1, established: false)
+        #expect(service.areResourcesProtected)
+        #expect(!service.usesSecureChannel)
+        #expect(service.state.isAuthorizationControlRequired)
+        #expect(spy.securityUpdates == 2)
     }
 
     // MARK: Configuration

@@ -30,6 +30,15 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     /// Timeout for one read, write or secure request on the peripheral.
     public var requestTimeout: TimeInterval = 10
 
+    /// How long a request waits for its answer (a control point indication or a secure response) after the
+    /// write went out. BluetoothCommonKit's AC Data In send swallows ATT refusals, so without this a refused
+    /// secure request would leave its characteristic busy forever. For RACP the clock restarts on every
+    /// measurement notification, because a Report Stored Records transfer legitimately runs for minutes.
+    public var responseTimeout: TimeInterval = 10
+
+    /// Timers for pending answers; their own queue so a timeout cannot be starved by the peripheral's.
+    private let timeoutQueue = DispatchQueue(label: "org.tidepool.ContinuousGlucoseMonitorServiceKit.timeouts")
+
     /// Derived session key (SecurityManagerDelegate storage); nil until a key exchange completes. A host that
     /// persists pairing overrides this together with the nonce sequence number in `state`.
     open var sharedKeyData: Data?
@@ -40,12 +49,21 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     private var _state: CGMSensorState
     private var _sessionStartTime: CGMSessionStartTime?
     private var _usesSecureChannel = false
+    /// From AC Status: restriction map ID 0 means the sensor serves CGMS plainly and AC Data In refuses
+    /// requests; anything else means the CGMS characteristics are protected resources. nil until read.
+    private var _resourcesAreProtected: Bool?
     private var _isReady = false
     private var _linkLossReported = false
     private var _handshakeCompletion: ProcedureResultCompletion?
+    private var _handshakeTimeout: DispatchWorkItem?
     /// One per characteristic, like the control points they answer: a second request to a busy
     /// characteristic is refused with Procedure In Progress rather than silently replacing the first.
-    private var _pending: [CBUUID: ProcedureCompletion<Data>] = [:]
+    private var _pending: [CBUUID: PendingRequest] = [:]
+
+    private struct PendingRequest {
+        let completion: ProcedureCompletion<Data>
+        var timeout: DispatchWorkItem
+    }
 
     private func locked<T>(_ body: () -> T) -> T {
         lock.lock()
@@ -81,6 +99,8 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
         get { locked { _usesSecureChannel } }
         set { locked { _usesSecureChannel = newValue } }
     }
+
+    public var areResourcesProtected: Bool { locked { _resourcesAreProtected ?? false } }
 
     /// Set once configuration completed on the current link; cleared on every disconnect.
     private var isReady: Bool {
@@ -445,27 +465,64 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
 
     // MARK: - Pending completions
 
-    private func setPending(_ uuid: CBUUID, _ completion: @escaping ProcedureCompletion<Data>) -> Bool {
-        locked {
+    /// Registers the completion and arms its response timer; false when the characteristic is already busy.
+    func setPending(_ uuid: CBUUID, _ completion: @escaping ProcedureCompletion<Data>) -> Bool {
+        let timeout = makeTimeout(for: uuid)
+        let armed: Bool = locked {
             guard _pending[uuid] == nil else { return false }
-            _pending[uuid] = completion
+            _pending[uuid] = PendingRequest(completion: completion, timeout: timeout)
             return true
+        }
+        if armed {
+            timeoutQueue.asyncAfter(deadline: .now() + responseTimeout, execute: timeout)
+        } else {
+            timeout.cancel()
+        }
+        return armed
+    }
+
+    /// Removes the completion and disarms its timer; nil when nothing was waiting.
+    func takePending(_ uuid: CBUUID) -> ProcedureCompletion<Data>? {
+        let pending: PendingRequest? = locked { _pending.removeValue(forKey: uuid) }
+        pending?.timeout.cancel()
+        return pending?.completion
+    }
+
+    /// Restarts the response timer of a request that is still being answered (an RACP report in progress).
+    private func touchPending(_ uuid: CBUUID) {
+        let timeout = makeTimeout(for: uuid)
+        let rearmed: Bool = locked {
+            guard var pending = _pending[uuid] else { return false }
+            pending.timeout.cancel()
+            pending.timeout = timeout
+            _pending[uuid] = pending
+            return true
+        }
+        if rearmed {
+            timeoutQueue.asyncAfter(deadline: .now() + responseTimeout, execute: timeout)
+        } else {
+            timeout.cancel()
         }
     }
 
-    private func takePending(_ uuid: CBUUID) -> ProcedureCompletion<Data>? {
-        locked { _pending.removeValue(forKey: uuid) }
+    private func makeTimeout(for uuid: CBUUID) -> DispatchWorkItem {
+        DispatchWorkItem { [weak self] in
+            guard let self, let completion = takePending(uuid) else { return }
+            loggingDelegate?.logErrorEvent("no answer from \(uuid) within \(responseTimeout) s")
+            completion(.failure(.procedureTimeout))
+        }
     }
 
     /// Fails the waiting completions that `matching` selects (all of them by default), outside the lock.
     private func failPending(_ error: DeviceCommError, where matching: (CBUUID) -> Bool = { _ in true }) {
-        let failed: [ProcedureCompletion<Data>] = locked {
+        let failed: [PendingRequest] = locked {
             let selected = _pending.filter { matching($0.key) }
             for key in selected.keys { _pending.removeValue(forKey: key) }
             return Array(selected.values)
         }
-        for completion in failed {
-            completion(.failure(error))
+        for pending in failed {
+            pending.timeout.cancel()
+            pending.completion(.failure(error))
         }
     }
 
@@ -492,6 +549,8 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
                 sessionStartTime = startTime
             }
         case CGMCharacteristicUUID.measurement.cbUUID:
+            // Records of an RACP report in progress keep that request alive until its Response Code arrives.
+            touchPending(CGMCharacteristicUUID.recordAccessControlPoint.cbUUID)
             switch Self.decode({ try CGMMeasurementRecord.decodeRecords(data, e2eCRC: isE2EProtectionSupported) }) {
             case .success(let records):
                 delegate?.sensor(self, didReceiveMeasurements: records)
@@ -591,27 +650,75 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             }
         }
         delegate?.sensorConnectionStatusChanged(self)
-        authenticateIfRequired { [weak self] in
+        readAuthorizationStatus { [weak self] in
             guard let self else { return }
-            readFeatureIfUnknown { [weak self] in
+            authenticateIfRequired { [weak self] in
                 guard let self else { return }
-                getSessionStartTime { [weak self] _ in
+                readFeatureIfUnknown { [weak self] in
                     guard let self else { return }
-                    delegate?.sensorIsReady(self)
+                    getSessionStartTime { [weak self] _ in
+                        guard let self else { return }
+                        delegate?.sensorIsReady(self)
+                    }
                 }
             }
         }
     }
 
-    /// Runs the key exchange when the sensor requires Authorization Control and no session key is held, as the
-    /// pump kit checks `applicationSecurityEstablished` before its first status read. A failed exchange is
-    /// reported through `sensorDidCompleteAuthentication`; the reads that follow are then refused by the sensor.
+    /// AC Status says whether the sensor protects its CGMS characteristics right now, so it is read before
+    /// anything else and decides both the key exchange and the channel. A sensor without ACS leaves the
+    /// stored answer alone.
+    private func readAuthorizationStatus(then: @escaping () -> Void) {
+        guard let peripheralManager, peripheralManager.peripheral?.getACSCharacteristicWithUUID(.status) != nil else {
+            then()
+            return
+        }
+        peripheralManager.perform { [weak self] peripheralManager in
+            guard let self else { return }
+            do {
+                let status = try peripheralManager.readACSStatus(timeout: requestTimeout)
+                handleAuthorizationStatus(restrictionMapID: status.currentRestrictionMapID, flags: status.status)
+            } catch {
+                loggingDelegate?.logErrorEvent("ACS status read: \(error)")
+            }
+            then()
+        }
+    }
+
+    /// Runs the key exchange when the sensor protects its resources and no session key is held, as the pump
+    /// kit checks `applicationSecurityEstablished` before its first status read. A failed exchange is reported
+    /// through `sensorDidCompleteAuthentication`; the reads that follow are then refused by the sensor.
     private func authenticateIfRequired(then: @escaping () -> Void) {
         guard state.isAuthorizationControlRequired, !isSecurityEstablished else {
             then()
             return
         }
         establishSecureSession { _ in then() }
+    }
+
+    /// Read at connection and indicated whenever the sensor flips protection. Protection decides whether the
+    /// exchange is required; protection plus a held key decides the channel, because AC Data In answers
+    /// Request Not Supported while the restriction map ID is 0, even to a collector that holds the key.
+    private func handleAuthorizationStatus(restrictionMapID: Int, flags: StatusFlag) {
+        let protected = restrictionMapID != 0
+        loggingDelegate?.logReceiveEvent("ACS status: restriction map \(restrictionMapID), flags \(flags); resources \(protected ? "protected" : "open")")
+        locked { _resourcesAreProtected = protected }
+        updateState { $0.isAuthorizationControlRequired = protected }
+        applySecureChannelPolicy()
+    }
+
+    /// Secure channel on exactly when the sensor protects its resources and this collector holds the key. A
+    /// tester can still flip `usesSecureChannel` by hand afterwards to watch the sensor refuse the other path.
+    private func applySecureChannelPolicy() {
+        let shouldUse = isSecurityEstablished && areResourcesProtected
+        let changed: Bool = locked {
+            guard _usesSecureChannel != shouldUse else { return false }
+            _usesSecureChannel = shouldUse
+            return true
+        }
+        guard changed else { return }
+        loggingDelegate?.logConnectionEvent("CGM traffic now uses the \(shouldUse ? "secure channel" : "plain characteristics")")
+        delegate?.sensorDidUpdateSecurity(self)
     }
 
     private func readFeatureIfUnknown(then: @escaping () -> Void) {
@@ -662,10 +769,27 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     }
 
     private func takeHandshakeCompletion() -> ProcedureResultCompletion? {
-        locked {
-            defer { _handshakeCompletion = nil }
-            return _handshakeCompletion
+        let (completion, timeout): (ProcedureResultCompletion?, DispatchWorkItem?) = locked {
+            defer { _handshakeCompletion = nil; _handshakeTimeout = nil }
+            return (_handshakeCompletion, _handshakeTimeout)
         }
+        timeout?.cancel()
+        return completion
+    }
+
+    /// Every key-exchange step is a write answered by an AC Control Point indication; each one gets its own
+    /// wait, so a sensor that stops answering mid-exchange fails the handshake instead of hanging it.
+    private func armHandshakeTimeout() {
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, handshakeCompletion != nil else { return }
+            failHandshake(.procedureTimeout)
+        }
+        let previous: DispatchWorkItem? = locked {
+            defer { _handshakeTimeout = timeout }
+            return _handshakeTimeout
+        }
+        previous?.cancel()
+        timeoutQueue.asyncAfter(deadline: .now() + responseTimeout, execute: timeout)
     }
 
     /// Drops the session key through the security manager so it also resets the sequence number and its
@@ -705,7 +829,11 @@ extension ContinuousGlucoseMonitorService: BluetoothManagerDelegate {
     public func bluetoothManager(_ manager: BluetoothManager, peripheralManager: PeripheralManager, didReceiveValue value: Data, fromCharactistic uuid: CBUUID) {
         switch uuid {
         case ACCharacteristicUUID.status.cbUUID:
-            loggingDelegate?.logReceiveEvent("ACS status: \(String(describing: ACStatusDataHandler.handleData(value)))")
+            if let status = ACStatusDataHandler.handleData(value) {
+                handleAuthorizationStatus(restrictionMapID: status.currentRestrictionMapID, flags: status.status)
+            } else {
+                loggingDelegate?.logErrorEvent("ACS status: unexpected value \(value.hexadecimalString)")
+            }
         case ACCharacteristicUUID.controlPoint.cbUUID:
             handleAuthorizationControlPointResponse(value)
         case ACCharacteristicUUID.dataOutIndicate.cbUUID, ACCharacteristicUUID.dataOutNotify.cbUUID:
@@ -788,6 +916,7 @@ extension ContinuousGlucoseMonitorService: SecurityManagerDelegate, ACDataDataHa
         }
         loggingDelegate?.logSendEvent("procedure \(String(describing: acControlPoint.procedureIDForNextRequest()))")
         acControlPoint.procedureRunning = true
+        armHandshakeTimeout()
         let segments = acControlPoint.segmentPayload(request)
         peripheralManager.perform { [weak self] peripheralManager in
             guard let self else { return }
@@ -819,14 +948,13 @@ extension ContinuousGlucoseMonitorService: SecurityManagerDelegate, ACDataDataHa
     private func finishHandshake() {
         guard let completion = takeHandshakeCompletion() else { return }
         if isSecurityEstablished {
-            usesSecureChannel = true
             updateState { $0.uuidToHandleMap = acControlPoint.uuidToHandleMap }
-            loggingDelegate?.logConnectionEvent("secure session established; CGM traffic now uses the secure channel")
+            loggingDelegate?.logConnectionEvent("secure session established")
             delegate?.sensorDidCompleteAuthentication(self, error: nil)
         } else {
-            usesSecureChannel = false
             loggingDelegate?.logConnectionEvent("no secure session (key invalidated or exchange incomplete)")
         }
+        applySecureChannelPolicy()
         completion(.success)
     }
 
