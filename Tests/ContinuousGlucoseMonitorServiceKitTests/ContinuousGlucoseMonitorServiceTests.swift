@@ -112,19 +112,21 @@ struct ContinuousGlucoseMonitorServiceTests {
     }
 
     /// A Report Stored Records transfer can outlast any fixed wait, so each record restarts the RACP clock;
-    /// the request only times out once the records stop without a Response Code.
+    /// the request only times out once the records stop without a Response Code. The gaps between records
+    /// are well inside the timeout: suites run in parallel, and a sleep that overruns by a few hundred
+    /// milliseconds must not let the timer win.
     @Test func racpReportStaysPendingWhileRecordsArrive() async throws {
-        service.responseTimeout = 0.3
+        service.responseTimeout = 0.8
         let box = ResultBox()
         #expect(service.setPending(.racp(.reportStoredRecords)) { box.results.append($0) })
         let record = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 1, sensorStatus: [], trend: nil, quality: nil)
-        for _ in 0..<5 {
-            try await Task.sleep(for: .milliseconds(150))
+        for _ in 0..<4 {
+            try await Task.sleep(for: .milliseconds(300))
             receive(record.encoded(e2eCRC: false), on: .measurement)
         }
-        #expect(box.results.isEmpty)   // 750 ms in, still waiting thanks to the records
+        #expect(box.results.isEmpty)   // 1.2 s in, past the timeout, still waiting thanks to the records
 
-        try await Task.sleep(for: .milliseconds(600))
+        try await Task.sleep(for: .milliseconds(1200))
         #expect(box.results == [.failure(.procedureTimeout)])
     }
 
