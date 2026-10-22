@@ -442,6 +442,14 @@ public enum CGMRACPResponse: Equatable, Sendable {
     case responseCode(request: UInt8, code: UInt8)
     case numberOfStoredRecords(UInt16)
 
+    /// The op code of the request this indication answers; Number of Stored Records has only one.
+    public var requestOpcode: UInt8 {
+        switch self {
+        case .responseCode(let request, _): return request
+        case .numberOfStoredRecords: return CGMRACPOpcode.reportNumberOfStoredRecords.rawValue
+        }
+    }
+
     public init(data: Data) throws {
         guard data.count >= 4 else {
             throw CGMCodecError.truncated(expected: 4, actual: data.count)
