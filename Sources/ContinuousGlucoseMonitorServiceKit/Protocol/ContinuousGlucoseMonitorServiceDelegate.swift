@@ -30,7 +30,9 @@ public protocol CGMSensorDelegate: AnyObject {
     func sensor(_ sensor: CGMSensorComms, didDiscoverSensorWithName name: String?, identifier: UUID, advertisementData: [String: Any], signalStrength: NSNumber)
     /// Connected or disconnected; read `isConnected`.
     func sensorConnectionStatusChanged(_ sensor: CGMSensorComms)
-    /// Connected, Feature and Session Start Time read, and the secure session established when required.
+    /// Connected, Feature and Session Start Time read, and the secure session established when required. Not
+    /// called when a setup step fails; that arrives as `sensor(_:didEncounterError:forCharacteristic:)` (or as
+    /// the connection change when the link itself was lost).
     func sensorIsReady(_ sensor: CGMSensorComms)
     /// The ACS key exchange finished, or the secure session was lost (`error` set).
     func sensorDidCompleteAuthentication(_ sensor: CGMSensorComms, error: DeviceCommError?)
@@ -45,7 +47,8 @@ public protocol CGMSensorDelegate: AnyObject {
     func sensor(_ sensor: CGMSensorComms, didReceiveSpecificOpsResponse response: CGMSpecificOpsResponse)
     /// Every decoded RACP indication, including the one that completes a pending request.
     func sensor(_ sensor: CGMSensorComms, didReceiveRACPResponse response: CGMRACPResponse)
-    /// A value that could not be decoded or a characteristic error outside any pending request.
+    /// A value that could not be decoded, a characteristic error outside any pending request, or (with a nil
+    /// characteristic) a connection-setup step that failed, in which case `sensorIsReady` will not follow.
     func sensor(_ sensor: CGMSensorComms, didEncounterError error: DeviceCommError, forCharacteristic uuid: CBUUID?)
     /// `state` changed; persist it.
     func sensorDidUpdateState(_ sensor: CGMSensorComms)
@@ -117,7 +120,9 @@ public protocol CGMSensorComms: AnyObject {
     /// Success completes with the matching `DeviceCommError`.
     func sendSpecificOpsRequest(_ opcode: CGMSpecificOpsOpcode, operand: Data, completion: @escaping CGMSpecificOpsCompletion)
     /// Any RACP procedure. Report Stored Records completes with the closing Response Code; the records
-    /// themselves arrive through `sensor(_:didReceiveMeasurements:)`.
+    /// themselves arrive through `sensor(_:didReceiveMeasurements:)`. One procedure runs at a time (a second
+    /// is refused with Procedure In Progress); Abort Operation may be sent while one runs, and when it
+    /// succeeds the aborted procedure completes with Procedure Not Completed.
     func sendRACPRequest(_ request: CGMRACPRequest, completion: @escaping CGMRACPCompletion)
 
     // MARK: Authorization Control
@@ -194,6 +199,8 @@ public extension CGMSensorComms {
         sendRACPRequest(CGMRACPRequest(opcode: .deleteStoredRecords, racpOperator: racpOperator, minimum: minimum, maximum: maximum), completion: completion)
     }
 
+    /// Cancels the RACP procedure in progress (CGMS §3.6.3.5). Completes with the Abort's own Response Code;
+    /// on Success the aborted procedure's completion fails with Procedure Not Completed.
     func abortRACPOperation(completion: @escaping CGMRACPCompletion) {
         sendRACPRequest(.abort, completion: completion)
     }

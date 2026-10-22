@@ -9,8 +9,10 @@
 //  `InsulinDeliveryService` in the pump kit so a Loop CGM plugin and the simulator's test client share it.
 //  One pending completion per characteristic: a control point write is answered by an indication on that
 //  characteristic, a read by its value, a secure request by AC Data Out carrying the characteristic's handle.
-//  Callbacks arrive on two queues (the peripheral's and the central manager's), so the mutable fields sit
-//  behind one lock and the delegate is never called while it is held.
+//  The RACP is the exception: its answers name the request op code they belong to, so a running procedure
+//  and the Abort Operation that cancels it wait side by side. Callbacks arrive on two queues (the
+//  peripheral's and the central manager's), so the mutable fields sit behind one lock and the delegate is
+//  never called while it is held.
 
 import CoreBluetooth
 import BluetoothCommonKit
@@ -54,15 +56,55 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     private var _resourcesAreProtected: Bool?
     private var _isReady = false
     private var _linkLossReported = false
+    /// Bumped each time a link's setup starts, so a setup chain left over from an earlier link cannot report
+    /// ready on the current one.
+    private var _setupGeneration = 0
     private var _handshakeCompletion: ProcedureResultCompletion?
     private var _handshakeTimeout: DispatchWorkItem?
     /// One per characteristic, like the control points they answer: a second request to a busy
     /// characteristic is refused with Procedure In Progress rather than silently replacing the first.
-    private var _pending: [CBUUID: PendingRequest] = [:]
+    private var _pending: [PendingKey: PendingRequest] = [:]
 
     private struct PendingRequest {
         let completion: ProcedureCompletion<Data>
         var timeout: DispatchWorkItem
+    }
+
+    /// What a waiting completion is keyed on. Every characteristic has one slot, except the RACP, whose
+    /// answers carry the request op code they belong to (a Response Code names it; Number of Stored Records
+    /// answers Report Number of Stored Records), so an Abort Operation can wait next to the procedure it cancels.
+    struct PendingKey: Hashable, CustomStringConvertible {
+        let uuid: CBUUID
+        /// The RACP request op code; nil for every other characteristic.
+        let racpOpcode: UInt8?
+
+        init(_ uuid: CBUUID, racpOpcode: UInt8? = nil) {
+            self.uuid = uuid
+            self.racpOpcode = racpOpcode
+        }
+
+        static func racp(_ opcode: CGMRACPOpcode) -> PendingKey {
+            PendingKey(CGMCharacteristicUUID.recordAccessControlPoint.cbUUID, racpOpcode: opcode.rawValue)
+        }
+
+        /// An RACP request other than Abort: the sensor runs one of these at a time.
+        var isRACPProcedure: Bool {
+            guard let racpOpcode else { return false }
+            return racpOpcode != CGMRACPOpcode.abortOperation.rawValue
+        }
+
+        var description: String {
+            guard let racpOpcode else { return uuid.uuidString }
+            return "\(uuid.uuidString) \(CGMRACPOpcode(rawValue: racpOpcode)?.name ?? "op code 0x\(String(racpOpcode, radix: 16))")"
+        }
+    }
+
+    /// The RACP is keyed by the request's op code (its first octet); everything else by the characteristic.
+    private func pendingKey(for characteristic: CGMCharacteristicUUID, request: Data?) -> PendingKey {
+        guard characteristic == .recordAccessControlPoint, let opcode = request?.first else {
+            return PendingKey(characteristic.cbUUID)
+        }
+        return PendingKey(characteristic.cbUUID, racpOpcode: opcode)
     }
 
     private func locked<T>(_ body: () -> T) -> T {
@@ -393,8 +435,8 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             completion(.failure(.commandFailed("characteristic \(characteristic.name) not available")))
             return
         }
-        let uuid = characteristic.cbUUID
-        if answeredByIndication, !setPending(uuid, completion) {
+        let key = pendingKey(for: characteristic, request: request)
+        if answeredByIndication, !setPending(key, completion) {
             completion(.failure(.procedureInProgress))
             return
         }
@@ -408,7 +450,7 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
                 let commError = Self.commError(from: error)
                 // The indication may already have answered; only a completion still waiting hears the refusal.
                 if answeredByIndication {
-                    takePending(uuid)?(.failure(commError))
+                    takePending(key)?(.failure(commError))
                 } else {
                     completion(.failure(commError))
                 }
@@ -431,8 +473,8 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             completion(.failure(.deviceNotReady))
             return
         }
-        let uuid = characteristic.cbUUID
-        guard setPending(uuid, completion) else {
+        let key = pendingKey(for: characteristic, request: request)
+        guard setPending(key, completion) else {
             completion(.failure(.procedureInProgress))
             return
         }
@@ -440,7 +482,7 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             guard let self else { return }
             loggingDelegate?.logSendEvent("secure \(request == nil ? "read" : "write") \(characteristic.name) via handle \(handle)")
             if case .failure(let error) = acData.sendRequest(request, resourceHandle: handle, peripherialManager: peripheralManager, timeout: requestTimeout) {
-                takePending(uuid)?(.failure(error))
+                takePending(key)?(.failure(error))
             }
         }
     }
@@ -466,11 +508,14 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     // MARK: - Pending completions
 
     /// Registers the completion and arms its response timer; false when the characteristic is already busy.
-    func setPending(_ uuid: CBUUID, _ completion: @escaping ProcedureCompletion<Data>) -> Bool {
-        let timeout = makeTimeout(for: uuid)
+    /// On the RACP, busy means another procedure is running (the sensor would refuse a second one, CGMS
+    /// §3.6.3.6); Abort Operation is exempt, since cancelling the running procedure is what it is for.
+    func setPending(_ key: PendingKey, _ completion: @escaping ProcedureCompletion<Data>) -> Bool {
+        let timeout = makeTimeout(for: key)
         let armed: Bool = locked {
-            guard _pending[uuid] == nil else { return false }
-            _pending[uuid] = PendingRequest(completion: completion, timeout: timeout)
+            guard _pending[key] == nil else { return false }
+            if key.isRACPProcedure, _pending.keys.contains(where: \.isRACPProcedure) { return false }
+            _pending[key] = PendingRequest(completion: completion, timeout: timeout)
             return true
         }
         if armed {
@@ -482,20 +527,20 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     }
 
     /// Removes the completion and disarms its timer; nil when nothing was waiting.
-    func takePending(_ uuid: CBUUID) -> ProcedureCompletion<Data>? {
-        let pending: PendingRequest? = locked { _pending.removeValue(forKey: uuid) }
+    func takePending(_ key: PendingKey) -> ProcedureCompletion<Data>? {
+        let pending: PendingRequest? = locked { _pending.removeValue(forKey: key) }
         pending?.timeout.cancel()
         return pending?.completion
     }
 
     /// Restarts the response timer of a request that is still being answered (an RACP report in progress).
-    private func touchPending(_ uuid: CBUUID) {
-        let timeout = makeTimeout(for: uuid)
+    private func touchPending(_ key: PendingKey) {
+        let timeout = makeTimeout(for: key)
         let rearmed: Bool = locked {
-            guard var pending = _pending[uuid] else { return false }
+            guard var pending = _pending[key] else { return false }
             pending.timeout.cancel()
             pending.timeout = timeout
-            _pending[uuid] = pending
+            _pending[key] = pending
             return true
         }
         if rearmed {
@@ -505,16 +550,16 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
         }
     }
 
-    private func makeTimeout(for uuid: CBUUID) -> DispatchWorkItem {
+    private func makeTimeout(for key: PendingKey) -> DispatchWorkItem {
         DispatchWorkItem { [weak self] in
-            guard let self, let completion = takePending(uuid) else { return }
-            loggingDelegate?.logErrorEvent("no answer from \(uuid) within \(responseTimeout) s")
+            guard let self, let completion = takePending(key) else { return }
+            loggingDelegate?.logErrorEvent("no answer from \(key) within \(responseTimeout) s")
             completion(.failure(.procedureTimeout))
         }
     }
 
     /// Fails the waiting completions that `matching` selects (all of them by default), outside the lock.
-    private func failPending(_ error: DeviceCommError, where matching: (CBUUID) -> Bool = { _ in true }) {
+    private func failPending(_ error: DeviceCommError, where matching: (PendingKey) -> Bool = { _ in true }) {
         let failed: [PendingRequest] = locked {
             let selected = _pending.filter { matching($0.key) }
             for key in selected.keys { _pending.removeValue(forKey: key) }
@@ -550,7 +595,7 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             }
         case CGMCharacteristicUUID.measurement.cbUUID:
             // Records of an RACP report in progress keep that request alive until its Response Code arrives.
-            touchPending(CGMCharacteristicUUID.recordAccessControlPoint.cbUUID)
+            touchPending(.racp(.reportStoredRecords))
             switch Self.decode({ try CGMMeasurementRecord.decodeRecords(data, e2eCRC: isE2EProtectionSupported) }) {
             case .success(let records):
                 delegate?.sensor(self, didReceiveMeasurements: records)
@@ -558,9 +603,8 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
                 delegate?.sensor(self, didEncounterError: error, forCharacteristic: uuid)
             }
         case CGMCharacteristicUUID.recordAccessControlPoint.cbUUID:
-            if case .success(let response) = Self.decode({ try CGMRACPResponse(data: data) }) {
-                delegate?.sensor(self, didReceiveRACPResponse: response)
-            }
+            handleRACPIndication(data, completesPending: completesPending)
+            return
         case CGMCharacteristicUUID.specificOpsControlPoint.cbUUID:
             if case .success(let response) = Self.decode({ try CGMSpecificOpsResponse(data: data, e2eCRC: isE2EProtectionSupported) }) {
                 delegate?.sensor(self, didReceiveSpecificOpsResponse: response)
@@ -570,7 +614,28 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
         }
 
         if completesPending {
-            takePending(uuid)?(.success(data))
+            takePending(PendingKey(uuid))?(.success(data))
+        }
+    }
+
+    /// An RACP indication completes the request whose op code it names. An Abort Operation that succeeded
+    /// also ends the procedure it cancelled: the sensor sends no Response Code for an aborted procedure (GLS
+    /// RACP), so that request completes with Procedure Not Completed instead of waiting for its timeout.
+    private func handleRACPIndication(_ data: Data, completesPending: Bool) {
+        let uuid = CGMCharacteristicUUID.recordAccessControlPoint.cbUUID
+        switch Self.decode({ try CGMRACPResponse(data: data) }) {
+        case .success(let response):
+            delegate?.sensor(self, didReceiveRACPResponse: response)
+            guard completesPending else { return }
+            takePending(PendingKey(uuid, racpOpcode: response.requestOpcode))?(.success(data))
+            if case let .responseCode(request, code) = response,
+               request == CGMRACPOpcode.abortOperation.rawValue, code == CGMRACPResponseCode.success.rawValue
+            {
+                failPending(.procedureNotCompleted) { $0.uuid == uuid }
+            }
+        case .failure(let error):
+            // An indication that cannot be decoded names no request, so everything waiting on the RACP hears it.
+            if completesPending { failPending(error) { $0.uuid == uuid } }
         }
     }
 
@@ -634,13 +699,16 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     /// As in the pump kit, the ACS key exchange comes first when the sensor requires it, because a protected
     /// sensor refuses every plain CGMS read until then. Then the Feature is read if this sensor's is not known
     /// yet (CGMS §3.1; it decides E2E-CRC handling, and it is a property of the device, so once is enough),
-    /// then the Session Start Time for calibration stamping, then ready is reported. A measurement that lands
-    /// before a first-ever Feature read is decoded without the CRC check; that window closes within the first
-    /// second of pairing.
+    /// then the Session Start Time for calibration stamping, then ready is reported. Ready means every step
+    /// succeeded on the link it started on: a failed step ends the setup (reported through
+    /// `sensor(_:didEncounterError:forCharacteristic:)`, or as the connection change when the link itself went),
+    /// and a chain outlived by its link stops where it is. A measurement that lands before a first-ever Feature
+    /// read is decoded without the CRC check; that window closes within the first second of pairing.
     private func handleConnected() {
-        let alreadyReady: Bool = locked {
+        let (alreadyReady, generation): (Bool, Int) = locked {
             defer { _isReady = true; _linkLossReported = false }
-            return _isReady   // configuration can complete more than once on one link
+            if !_isReady { _setupGeneration += 1 }
+            return (_isReady, _setupGeneration)   // configuration can complete more than once on one link
         }
         guard !alreadyReady else { return }
         if let peripheral = peripheralManager?.peripheral {
@@ -650,17 +718,42 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             }
         }
         delegate?.sensorConnectionStatusChanged(self)
-        readAuthorizationStatus { [weak self] in
-            guard let self else { return }
-            authenticateIfRequired { [weak self] in
-                guard let self else { return }
-                readFeatureIfUnknown { [weak self] in
-                    guard let self else { return }
-                    getSessionStartTime { [weak self] _ in
-                        guard let self else { return }
-                        delegate?.sensorIsReady(self)
+        readAuthorizationStatus { [weak self] result in
+            self?.continueSetup(onLink: generation, step: "AC Status read", result) {
+                self?.authenticateIfRequired { result in
+                    self?.continueSetup(onLink: generation, step: "key exchange", result) {
+                        self?.readFeatureIfUnknown { result in
+                            self?.continueSetup(onLink: generation, step: "Feature read", result) {
+                                self?.getSessionStartTime { result in
+                                    self?.continueSetup(onLink: generation, step: "Session Start Time read", result.map { _ in () }) {
+                                        guard let self else { return }
+                                        self.loggingDelegate?.logConnectionEvent("sensor ready")
+                                        self.delegate?.sensorIsReady(self)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// Runs `next` when the step succeeded and the link that started the setup is still the current one.
+    private func continueSetup(onLink generation: Int, step: String, _ result: DeviceCommResult<Void>, next: () -> Void) {
+        let isCurrentLink: Bool = locked { _isReady && _setupGeneration == generation }
+        guard isCurrentLink else {
+            loggingDelegate?.logConnectionEvent("\(step) finished after its link went; setup abandoned")
+            return
+        }
+        switch result {
+        case .success:
+            next()
+        case .failure(let error):
+            loggingDelegate?.logErrorEvent("\(step) failed: \(error); the sensor will not be reported ready")
+            // A lost link was already reported as a connection change.
+            if error != .disconnected {
+                delegate?.sensor(self, didEncounterError: error, forCharacteristic: nil)
             }
         }
     }
@@ -668,9 +761,9 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     /// AC Status says whether the sensor protects its CGMS characteristics right now, so it is read before
     /// anything else and decides both the key exchange and the channel. A sensor without ACS leaves the
     /// stored answer alone.
-    private func readAuthorizationStatus(then: @escaping () -> Void) {
+    private func readAuthorizationStatus(then: @escaping ProcedureResultCompletion) {
         guard let peripheralManager, peripheralManager.peripheral?.getACSCharacteristicWithUUID(.status) != nil else {
-            then()
+            then(.success)
             return
         }
         peripheralManager.perform { [weak self] peripheralManager in
@@ -678,22 +771,22 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             do {
                 let status = try peripheralManager.readACSStatus(timeout: requestTimeout)
                 handleAuthorizationStatus(restrictionMapID: status.currentRestrictionMapID, flags: status.status)
+                then(.success)
             } catch {
-                loggingDelegate?.logErrorEvent("ACS status read: \(error)")
+                then(.failure(Self.commError(from: error)))
             }
-            then()
         }
     }
 
     /// Runs the key exchange when the sensor protects its resources and no session key is held, as the pump
-    /// kit checks `applicationSecurityEstablished` before its first status read. A failed exchange is reported
-    /// through `sensorDidCompleteAuthentication`; the reads that follow are then refused by the sensor.
-    private func authenticateIfRequired(then: @escaping () -> Void) {
+    /// kit checks `applicationSecurityEstablished` before its first status read. A failed exchange is also
+    /// reported through `sensorDidCompleteAuthentication`.
+    private func authenticateIfRequired(then: @escaping ProcedureResultCompletion) {
         guard state.isAuthorizationControlRequired, !isSecurityEstablished else {
-            then()
+            then(.success)
             return
         }
-        establishSecureSession { _ in then() }
+        establishSecureSession(completion: then)
     }
 
     /// Read at connection and indicated whenever the sensor flips protection. Protection decides whether the
@@ -721,16 +814,13 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
         delegate?.sensorDidUpdateSecurity(self)
     }
 
-    private func readFeatureIfUnknown(then: @escaping () -> Void) {
+    private func readFeatureIfUnknown(then: @escaping ProcedureResultCompletion) {
         guard feature == nil else {
             loggingDelegate?.logConnectionEvent("feature already known for this sensor")
-            then()
+            then(.success)
             return
         }
-        getFeature { [weak self] result in
-            if case .failure(let error) = result { self?.loggingDelegate?.logErrorEvent("feature read: \(error)") }
-            then()
-        }
+        getFeature { result in then(result.map { _ in () }) }
     }
 
     /// The link is gone, or never came up. Reported to the delegate once per loss; BluetoothCommonKit can
@@ -794,9 +884,11 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
 
     /// Drops the session key through the security manager so it also resets the sequence number and its
     /// first-nonce flag; resetting the sequence number alone leaves the even/odd nonce scheme on the wrong
-    /// parity for the next exchange.
+    /// parity for the next exchange. With no key held, the next exchange has to derive one: BluetoothCommonKit
+    /// only queues the ECDH steps while `willExchangeParentKey` is set, and clears it after the first exchange.
     public func deleteStoredKey() {
         securityManager.prepareForDeactivation()
+        acControlPoint.willExchangeParentKey = true
     }
 }
 
@@ -875,6 +967,9 @@ extension ContinuousGlucoseMonitorService: SecurityManagerDelegate, ACDataDataHa
             return
         }
         loggingDelegate?.logSendEvent("starting key exchange")
+        // A full exchange every time this is asked for, also when a key is still held (a tester re-pairing
+        // with a new sensor key); the handler would otherwise only re-sync the nonce after its first run.
+        acControlPoint.willExchangeParentKey = true
         acControlPoint.queueConfigurationRequests()
         sendNextAuthorizationRequest()
     }
@@ -982,7 +1077,7 @@ extension ContinuousGlucoseMonitorService: SecurityManagerDelegate, ACDataDataHa
             loggingDelegate?.logErrorEvent("secure response error: \(error)")
             // Only requests that went over the secure channel can be waiting on this frame; a plain control
             // point write is still owed its own indication.
-            failPending(error) { [weak self] uuid in self?.resourceHandle(for: uuid) != nil }
+            failPending(error) { [weak self] key in self?.resourceHandle(for: key.uuid) != nil }
         }
     }
 

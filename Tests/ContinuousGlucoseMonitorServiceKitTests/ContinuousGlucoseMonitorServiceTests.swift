@@ -24,12 +24,14 @@ struct ContinuousGlucoseMonitorServiceTests {
         var racpResponses: [CGMRACPResponse] = []
         var errors: [(DeviceCommError, CBUUID?)] = []
         var connectionChanges = 0
+        var readyReports = 0
         var stateUpdates = 0
         var authentications: [DeviceCommError?] = []
         var securityUpdates = 0
 
         func sensor(_ sensor: CGMSensorComms, didDiscoverSensorWithName name: String?, identifier: UUID, advertisementData: [String: Any], signalStrength: NSNumber) { }
         func sensorConnectionStatusChanged(_ sensor: CGMSensorComms) { connectionChanges += 1 }
+        func sensorIsReady(_ sensor: CGMSensorComms) { readyReports += 1 }
         func sensorDidCompleteAuthentication(_ sensor: CGMSensorComms, error: DeviceCommError?) { authentications.append(error) }
         func sensorDidUpdateSecurity(_ sensor: CGMSensorComms) { securityUpdates += 1 }
         func sensor(_ sensor: CGMSensorComms, didReceiveMeasurements records: [CGMMeasurementRecord]) { measurements.append(records) }
@@ -84,24 +86,24 @@ struct ContinuousGlucoseMonitorServiceTests {
     /// AC Data In send swallows.
     @Test func unansweredRequestTimesOutAndFreesTheCharacteristic() async throws {
         service.responseTimeout = 0.1
-        let uuid = CGMCharacteristicUUID.specificOpsControlPoint.cbUUID
+        let key = ContinuousGlucoseMonitorService.PendingKey(CGMCharacteristicUUID.specificOpsControlPoint.cbUUID)
         let box = ResultBox()
-        #expect(service.setPending(uuid) { box.results.append($0) })
-        #expect(!service.setPending(uuid) { _ in })   // busy until answered or timed out
+        #expect(service.setPending(key) { box.results.append($0) })
+        #expect(!service.setPending(key) { _ in })   // busy until answered or timed out
 
         try await Task.sleep(for: .milliseconds(400))
         #expect(box.results == [.failure(.procedureTimeout)])
-        #expect(service.takePending(uuid) == nil)
-        #expect(service.setPending(uuid) { _ in })    // free again
-        _ = service.takePending(uuid)
+        #expect(service.takePending(key) == nil)
+        #expect(service.setPending(key) { _ in })    // free again
+        _ = service.takePending(key)
     }
 
     /// The answer disarms the timer: one completion, never a late timeout on top.
     @Test func answeredRequestDoesNotTimeOutLater() async throws {
         service.responseTimeout = 0.1
-        let uuid = CGMCharacteristicUUID.specificOpsControlPoint.cbUUID
+        let key = ContinuousGlucoseMonitorService.PendingKey(CGMCharacteristicUUID.specificOpsControlPoint.cbUUID)
         let box = ResultBox()
-        #expect(service.setPending(uuid) { box.results.append($0) })
+        #expect(service.setPending(key) { box.results.append($0) })
         receive(CGMSpecificOpsResponse.communicationInterval(minutes: 5).encoded(e2eCRC: false), on: .specificOpsControlPoint)
         #expect(box.results.count == 1)
 
@@ -113,9 +115,8 @@ struct ContinuousGlucoseMonitorServiceTests {
     /// the request only times out once the records stop without a Response Code.
     @Test func racpReportStaysPendingWhileRecordsArrive() async throws {
         service.responseTimeout = 0.3
-        let uuid = CGMCharacteristicUUID.recordAccessControlPoint.cbUUID
         let box = ResultBox()
-        #expect(service.setPending(uuid) { box.results.append($0) })
+        #expect(service.setPending(.racp(.reportStoredRecords)) { box.results.append($0) })
         let record = CGMMeasurementRecord(glucoseConcentration: 100, timeOffset: 1, sensorStatus: [], trend: nil, quality: nil)
         for _ in 0..<5 {
             try await Task.sleep(for: .milliseconds(150))
@@ -125,6 +126,79 @@ struct ContinuousGlucoseMonitorServiceTests {
 
         try await Task.sleep(for: .milliseconds(600))
         #expect(box.results == [.failure(.procedureTimeout)])
+    }
+
+    // MARK: RACP answer matching
+
+    private func racpResponseCode(_ request: CGMRACPOpcode, _ code: CGMRACPResponseCode) -> Data {
+        CGMRACPResponse.responseCode(request: request.rawValue, code: code.rawValue).encoded()
+    }
+
+    /// Abort Operation exists to cancel a running procedure, so it is the one request the RACP accepts while
+    /// busy. Its Success also ends the aborted request, which the sensor sends no Response Code for.
+    @Test func abortJoinsARunningReportAndEndsItOnSuccess() throws {
+        let report = ResultBox()
+        let abort = ResultBox()
+        #expect(service.setPending(.racp(.reportStoredRecords)) { report.results.append($0) })
+        #expect(!service.setPending(.racp(.reportNumberOfStoredRecords)) { _ in })   // one procedure at a time
+        #expect(service.setPending(.racp(.abortOperation)) { abort.results.append($0) })
+
+        let abortSuccess = racpResponseCode(.abortOperation, .success)
+        receive(abortSuccess, on: .recordAccessControlPoint)
+        #expect(abort.results == [.success(abortSuccess)])
+        #expect(report.results == [.failure(.procedureNotCompleted)])
+        #expect(service.setPending(.racp(.reportNumberOfStoredRecords)) { _ in })   // the RACP is free again
+        _ = service.takePending(.racp(.reportNumberOfStoredRecords))
+    }
+
+    /// Each RACP indication completes the request whose op code it names, so an Abort that failed leaves the
+    /// report waiting for its own closing Response Code.
+    @Test func racpAnswersCompleteTheRequestTheyName() throws {
+        let report = ResultBox()
+        let abort = ResultBox()
+        #expect(service.setPending(.racp(.reportStoredRecords)) { report.results.append($0) })
+        #expect(service.setPending(.racp(.abortOperation)) { abort.results.append($0) })
+
+        receive(racpResponseCode(.abortOperation, .abortUnsuccessful), on: .recordAccessControlPoint)
+        #expect(abort.results.count == 1)
+        #expect(report.results.isEmpty)
+
+        let reportDone = racpResponseCode(.reportStoredRecords, .success)
+        receive(reportDone, on: .recordAccessControlPoint)
+        #expect(report.results == [.success(reportDone)])
+
+        // Number of Stored Records has no op code field; it answers Report Number of Stored Records.
+        let count = ResultBox()
+        #expect(service.setPending(.racp(.reportNumberOfStoredRecords)) { count.results.append($0) })
+        let countValue = CGMRACPResponse.numberOfStoredRecords(7).encoded()
+        receive(countValue, on: .recordAccessControlPoint)
+        #expect(count.results == [.success(countValue)])
+        #expect(spy.racpResponses.count == 3)
+    }
+
+    // MARK: Connection setup
+
+    /// Ready means every setup step succeeded. Without a peripheral the Feature read fails, so the connection is
+    /// reported but readiness is not, and the host hears why.
+    @Test func readyIsNotReportedWhenASetupStepFails() throws {
+        service.bluetoothManager(bluetoothManager, peripheralManager: peripheralManager, isReadyWithError: nil)
+        #expect(spy.connectionChanges == 1)
+        #expect(spy.readyReports == 0)
+        let setupError = try #require(spy.errors.last)
+        guard case .commandFailed = setupError.0 else {
+            Issue.record("expected the failed Feature read as the setup error, got \(setupError.0)")
+            return
+        }
+        #expect(setupError.1 == nil)
+    }
+
+    /// BluetoothCommonKit only queues the ECDH steps while its `willExchangeParentKey` flag is set, and it
+    /// clears the flag after the first exchange. The key does not survive a link loss, so the next link's
+    /// exchange has to be a full one again rather than a nonce re-sync that leaves the collector without a key.
+    @Test func linkLossArmsAFullKeyExchangeForTheNextLink() throws {
+        service.acControlPoint.willExchangeParentKey = false   // as the handler leaves it after one exchange
+        service.bluetoothManager(bluetoothManager, peripheralManager: peripheralManager, isReadyWithError: CBError(.peripheralDisconnected))
+        #expect(service.acControlPoint.willExchangeParentKey)
     }
 
     // MARK: Secure channel policy
