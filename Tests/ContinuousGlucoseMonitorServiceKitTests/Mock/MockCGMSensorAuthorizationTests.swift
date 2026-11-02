@@ -247,6 +247,30 @@ struct MockCGMSensorAuthorizationTests {
         #expect(queue.items.contains { $0.uuid == ACCharacteristicUUID.status.cbUUID })
     }
 
+    /// A host persisting the pairing (HYDRA-9) needs every key and nonce change: the exchange sets the key,
+    /// each secure indication steps the sequence number, and Invalidate drops the key.
+    @Test func securityChangesReachTheDelegate() {
+        let spy = DelegateSpy()
+        sensor.delegate = spy
+        let collector = Collector()
+        establishSecurity(collector)
+        let afterExchange = spy.updates
+        #expect(afterExchange > 0)
+        #expect(sensor.sharedKeyData != nil)
+
+        // A secure indication encrypts with the next nonce; the stepped sequence number reaches the delegate.
+        let sequenceBefore = sensor.securityManager.configuration.rawValue["sequenceNumber"] as? UInt64
+        sensor.authorizationDataCharacteristic.sendSecureIndication(Data([0x01]), to: CGMResourceHandle.handle(for: .status))
+        let sequenceAfter = sensor.securityManager.configuration.rawValue["sequenceNumber"] as? UInt64
+        #expect(sequenceAfter != nil && sequenceAfter != sequenceBefore)
+        #expect(spy.updates > afterExchange)
+
+        let beforeInvalidate = spy.updates
+        sensor.invalidateKey()
+        #expect(sensor.sharedKeyData == nil)
+        #expect(spy.updates > beforeInvalidate)
+    }
+
     @Test func protectedReadAndWriteTravelTheSecureChannel() throws {
         let collector = Collector()
         establishSecurity(collector)

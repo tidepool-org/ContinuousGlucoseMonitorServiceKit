@@ -225,8 +225,10 @@ extension MockCGMSensor: SecurityManagerDelegate {
         setSecurityEstablished(true)
     }
 
+    /// Fires on every nonce sequence step as well as on key exchange changes; a host persisting the pairing
+    /// saves the configuration here so a relaunch never reuses a nonce.
     public func securityManagerDidUpdateConfiguration(_ securityManager: SecurityManager) {
-        // Nothing to persist yet; session state is in-memory until the persistence phase.
+        notifyDelegate()
     }
 
     /// Updates AC Status (indicated when subscribed) and observers; no-op when unchanged.
