@@ -334,7 +334,14 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// Shared key held for the security manager (SecurityManagerDelegate storage): the raw ECDH secret
     /// during the exchange, the derived session key once confirmed, nil when invalidated or rejected.
     /// "Established" is reported through `securityManagerDidEstablishedSecurity`, not from this value.
-    public var sharedKeyData: Data?
+    /// A host that keeps the pairing across relaunches stores this together with the security manager
+    /// configuration, so every change reaches the delegate.
+    public var sharedKeyData: Data? {
+        didSet {
+            guard oldValue != sharedKeyData else { return }
+            notifyDelegate()
+        }
+    }
 
     public let authorizationStatusCharacteristic: ACStatusCharacteristic
     public let authorizationControlPoint: ACControlPointCharacteristic
