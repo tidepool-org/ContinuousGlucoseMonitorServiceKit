@@ -195,12 +195,38 @@ struct ContinuousGlucoseMonitorServiceTests {
     }
 
     /// BluetoothCommonKit only queues the ECDH steps while its `willExchangeParentKey` flag is set, and it
-    /// clears the flag after the first exchange. The key does not survive a link loss, so the next link's
-    /// exchange has to be a full one again rather than a nonce re-sync that leaves the collector without a key.
-    @Test func linkLossArmsAFullKeyExchangeForTheNextLink() throws {
+    /// clears the flag after the first exchange. Without a confirmed key the next link's exchange has to be a
+    /// full one again rather than a nonce re-sync that leaves the collector without a key.
+    @Test func linkLossWithoutAKeyArmsAFullKeyExchangeForTheNextLink() throws {
         service.acControlPoint.willExchangeParentKey = false   // as the handler leaves it after one exchange
         service.bluetoothManager(bluetoothManager, peripheralManager: peripheralManager, isReadyWithError: CBError(.peripheralDisconnected))
         #expect(service.acControlPoint.willExchangeParentKey)
+    }
+
+    /// A confirmed key survives a link loss, as in the pump kit: the sensor keeps its copy and the nonce
+    /// sequence keeps counting, so the next link resumes the secure channel without an exchange (HYDRA-9).
+    @Test func linkLossKeepsTheSessionKey() {
+        service.sharedKeyData = Data([1, 2, 3])
+        receiveACStatus(restrictionMapID: 1, established: true)
+        service.acControlPoint.willExchangeParentKey = false
+        service.bluetoothManager(bluetoothManager, peripheralManager: peripheralManager, isReadyWithError: CBError(.peripheralDisconnected))
+        #expect(service.isSecurityEstablished)
+        #expect(service.usesSecureChannel)
+        #expect(!service.acControlPoint.willExchangeParentKey)
+        #expect(spy.authentications.isEmpty)
+        #expect(spy.connectionChanges == 1)
+    }
+
+    /// AC Status is read first on every link; when the sensor reports no secure session the held key is
+    /// useless (the sensor forgot it, or another collector invalidated it) and a full exchange follows.
+    @Test func sensorWithoutTheSessionDropsTheHeldKey() {
+        service.sharedKeyData = Data([1, 2, 3])
+        service.acControlPoint.willExchangeParentKey = false
+        receiveACStatus(restrictionMapID: 1, established: false)
+        #expect(!service.isSecurityEstablished)
+        #expect(!service.usesSecureChannel)
+        #expect(service.acControlPoint.willExchangeParentKey)
+        #expect(spy.authentications == [.authenticationFailed])
     }
 
     // MARK: Secure channel policy

@@ -261,7 +261,7 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
         // Resetting the manager drops the peripheral before the disconnect callback, so BluetoothCommonKit
         // does not reconnect and no link-loss callback follows; the teardown and the delegate call happen here.
         bluetoothManager.reset()
-        resetLinkState()
+        resetLinkState(keepingKey: false)
         updateState {
             $0.identifier = nil
             $0.name = nil
@@ -274,7 +274,7 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     public func prepareForDeactivation() {
         loggingDelegate?.logConnectionEvent()
         isReady = false
-        resetLinkState()
+        resetLinkState(keepingKey: false)
         bluetoothManager.prepareForDeactivation()
     }
 
@@ -792,11 +792,22 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
     /// Read at connection and indicated whenever the sensor flips protection. Protection decides whether the
     /// exchange is required; protection plus a held key decides the channel, because AC Data In answers
     /// Request Not Supported while the restriction map ID is 0, even to a collector that holds the key.
+    /// AC Status bit 1 (ACS Security Established); BluetoothCommonKit keeps the flag names internal.
+    private static let securityEstablishedFlag = StatusFlag(rawValue: 1 << 1)
+
     private func handleAuthorizationStatus(restrictionMapID: Int, flags: StatusFlag) {
         let protected = restrictionMapID != 0
         loggingDelegate?.logReceiveEvent("ACS status: restriction map \(restrictionMapID), flags \(flags); resources \(protected ? "protected" : "open")")
         locked { _resourcesAreProtected = protected }
         updateState { $0.isAuthorizationControlRequired = protected }
+        // The sensor's view of the session wins: a key it no longer holds (forgotten, invalidated by another
+        // collector, lost with a restart) would only produce undecryptable traffic. Dropped here, before the
+        // connection setup decides on the exchange. Not during an exchange: the secret is unconfirmed then anyway.
+        if isSecurityEstablished, handshakeCompletion == nil, !flags.contains(Self.securityEstablishedFlag) {
+            loggingDelegate?.logConnectionEvent("sensor reports no secure session; the held key is dropped")
+            deleteStoredKey()
+            delegate?.sensorDidCompleteAuthentication(self, error: .authenticationFailed)
+        }
         applySecureChannelPolicy()
     }
 
@@ -834,26 +845,31 @@ open class ContinuousGlucoseMonitorService: CGMSensorComms {
             return (wasReady, shouldReport)
         }
         _ = wasReady
-        resetLinkState()
+        resetLinkState(keepingKey: true)
         if shouldReport { delegate?.sensorConnectionStatusChanged(self) }
     }
 
-    /// Everything a lost or abandoned link invalidates: the session cache, the secure session (the key and
-    /// nonce sequence cannot be trusted across a link loss), a key exchange in flight, and every waiting
-    /// request. The Feature stays: it belongs to the sensor, not the link.
-    private func resetLinkState() {
+    /// Everything a lost or abandoned link invalidates: the session cache, a key exchange in flight, and every
+    /// waiting request. The Feature stays: it belongs to the sensor, not the link. A confirmed session key stays
+    /// across a link loss as well, as in the pump kit: the sensor keeps its copy, the nonce sequence keeps
+    /// counting, and the next link resumes the secure channel without an exchange (AC Status, read first on
+    /// every link, says whether the sensor still holds it). An exchange that was still running only has an
+    /// unconfirmed secret, which is dropped. Forgetting the sensor and deactivating drop the key.
+    private func resetLinkState(keepingKey: Bool) {
         sessionStartTime = nil
+        let handshakeCompletion = takeHandshakeCompletion()
         let hadSecureSession = isSecurityEstablished || usesSecureChannel
-        deleteStoredKey()
-        usesSecureChannel = false
+        let keepsKey = keepingKey && isSecurityEstablished && handshakeCompletion == nil
+        if !keepsKey {
+            deleteStoredKey()
+            usesSecureChannel = false
+        }
         _ = acControlPoint.getPendingProceduresAndReset()   // also clears procedureRunning
         acControlPoint.resetSegmentation()
         acData.resetSegmentation()
         failPending(.disconnected)
-        if let completion = takeHandshakeCompletion() {
-            completion(.failure(.disconnected))
-        }
-        if hadSecureSession {
+        handshakeCompletion?(.failure(.disconnected))
+        if hadSecureSession && !keepsKey {
             delegate?.sensorDidCompleteAuthentication(self, error: .disconnected)
         }
     }
@@ -1104,7 +1120,7 @@ extension ContinuousGlucoseMonitorService: SecurityManagerDelegate, ACDataDataHa
     }
 
     /// As the pump kit does: the counters cannot be resynchronised in place, so the link is dropped and
-    /// BluetoothCommonKit reconnects; the key exchange runs again on the new link.
+    /// BluetoothCommonKit reconnects; the key is kept and the new link resumes the secure channel.
     private func reconnectToResolveCounterError() {
         loggingDelegate?.logConnectionEvent("reconnecting to resolve the counter error")
         failPending(.disconnected)
