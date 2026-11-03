@@ -8,7 +8,7 @@
 
 import Foundation
 
-/// A one-shot corruption of the next payload the sensor sends (HYD-C-009, HYD-F-008/009): the way a tester
+/// A one-shot corruption of the next payload the sensor sends: the way a tester
 /// proves the collector rejects a tampered message instead of acting on it. Toggling the E2E-CRC Feature bit
 /// cannot do that, because both sides re-read the Feature and agree; the fault keeps the Feature claiming
 /// E2E-CRC and breaks one message. Armed on the sensor, consumed by the next read response, notification or

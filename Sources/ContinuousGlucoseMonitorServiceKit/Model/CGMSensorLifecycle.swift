@@ -13,10 +13,10 @@ import Foundation
 /// Physical condition of the simulated sensor, independent of whether a session is running.
 public enum CGMSensorCondition: String, Codable, Sendable, CustomStringConvertible {
     case healthy
-    /// Temporary issue (TBD-05): readings carry NaN glucose, zero quality and the General Device Fault
+    /// Temporary issue: readings carry NaN glucose, zero quality and the General Device Fault
     /// bit until the tester resolves it.
     case impaired
-    /// Sensor failure (HYD-G-006): no readings and the Sensor Malfunction bit; terminal until the sensor is
+    /// Sensor failure: no readings and the Sensor Malfunction bit; terminal until the sensor is
     /// replaced from the tester UI.
     case failed
 
@@ -29,7 +29,7 @@ public enum CGMSensorCondition: String, Codable, Sendable, CustomStringConvertib
     }
 }
 
-/// One lifecycle action and how the sensor took it (TBD-07/08 ask for a historical record of replacement
+/// One lifecycle action and how the sensor took it (the requirements ask for a historical record of replacement
 /// and STOP including connection state, timestamp and acceptance).
 public struct CGMLifecycleEvent: Equatable, Sendable, Identifiable, CustomStringConvertible {
     public enum Kind: String, Sendable {
@@ -40,6 +40,8 @@ public struct CGMLifecycleEvent: Equatable, Sendable, Identifiable, CustomString
         case sensorFailed
         case temporaryIssueBegan
         case temporaryIssueResolved
+        /// The measurement database of an earlier run was put back after a power cycle.
+        case historyRestored
     }
 
     public enum Source: String, Sendable {

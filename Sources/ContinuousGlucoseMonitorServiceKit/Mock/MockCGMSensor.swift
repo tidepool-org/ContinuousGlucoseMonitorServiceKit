@@ -26,7 +26,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     let messageQueue: MessagingQueue
     private let now: () -> Date
 
-    /// Tester-set skew of the sensor's clock against the host (HYD-C-015/016). Captured when a session starts:
+    /// Tester-set skew of the sensor's clock against the host. Captured when a session starts:
     /// Session Start Time is written in sensor time (host + skew) while the session itself keeps running on
     /// the host clock, so a collector that trusts the start time timestamps the whole session off by this
     /// much. A real sensor's clock does not jump mid-session, so a change here waits for the next Start
@@ -89,7 +89,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// True once the collector has written CGM Session Start Time in the current session.
     public private(set) var sessionStartTimeSetByCollector = false
 
-    /// Seconds between measurements (HYD-G-001, default 5 min). Time Offset has one-minute resolution, so
+    /// Seconds between measurements (default 5 min). Time Offset has one-minute resolution, so
     /// sub-minute intervals produce several records with the same offset. Non-positive values are ignored:
     /// Foundation would clamp them to 0.1 ms and flood the main run loop.
     public var measurementInterval: TimeInterval = 5 * 60 {
@@ -129,7 +129,7 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     // MARK: Record database (CGMS §3.6)
 
-    /// Every measurement of the current session, for RACP reports and backfill after a link loss (HYD-G-015).
+    /// Every measurement of the current session, for RACP reports and backfill after a link loss.
     /// Cleared when a session starts (CGMS §3.4.5). Set `capacity` to change how much history is kept.
     public var recordStore = CGMRecordStore() {
         didSet {
@@ -138,7 +138,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         }
     }
 
-    /// Records packed into one CGM Measurement notification during an RACP report (HYD-G-013). The
+    /// Records packed into one CGM Measurement notification during an RACP report. The
     /// collector's ATT MTU must fit them; iOS negotiates well above the 23-octet default.
     public var recordsPerNotification = 1 {
         didSet { recordsPerNotification = max(1, recordsPerNotification) }
@@ -252,7 +252,7 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     // MARK: Lifecycle (CGM-DESIGN §Lifecycle)
 
-    /// Seconds after Start Session before readings begin (TBD-03 warm-up). Editable while a warm-up is in
+    /// Seconds after Start Session before readings begin (the warm-up). Editable while a warm-up is in
     /// progress: shortening it below the elapsed time ends the warm-up at once. Zero in the kit so tests run
     /// without waiting; the simulator app defaults to one minute.
     public var warmupDuration: TimeInterval = 0 {
@@ -282,7 +282,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// `resolveTemporaryIssue` and `replaceSensor`.
     public private(set) var condition: CGMSensorCondition = .healthy
 
-    /// Glucose the sensor can quantify (HYD-G-003). With Sensor Result High-Low Detection in the Feature, a
+    /// Glucose the sensor can quantify. With Sensor Result High-Low Detection in the Feature, a
     /// reading outside is reported at the boundary with the matching Device Can Process bit.
     public var sensorRange: ClosedRange<Double> = 40...400 {
         didSet {
@@ -464,7 +464,7 @@ public final class MockCGMSensor: @unchecked Sendable {
     // MARK: - Session control (tester UI and CGMCP)
 
     /// Starts a new session: Time Offset restarts at 0, Session Start Time is taken from the device clock and
-    /// the warm-up begins. Refused while the sensor has failed (HYD-G-006: terminal until replaced), which
+    /// the warm-up begins. Refused while the sensor has failed (terminal until replaced), which
     /// is recorded as a rejected lifecycle event. Returns whether the session started.
     @discardableResult
     public func startSession(source: CGMLifecycleEvent.Source = .tester) -> Bool {
@@ -481,7 +481,7 @@ public final class MockCGMSensor: @unchecked Sendable {
             lastMeasurement = nil
             measurementCount = 0
             scenarioIndex = 0
-            effectsGenerator = CGMSeededGenerator(seed: traceEffects.seed)   // HYD-C-018: same session, same noise
+            effectsGenerator = CGMSeededGenerator(seed: traceEffects.seed)   // same session, same noise
             recordStore.removeAll()   // CGMS §3.4.5: a new session clears the measurement database
             racpReportQueued = false
             calibrationStore.removeAll()   // §3.7.2.8: all data from the previous session is deleted
@@ -497,7 +497,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         return true
     }
 
-    /// Stops the running session (CGMS §3.7.2.9; TBD-08). Returns false, and records the rejection, when no
+    /// Stops the running session (CGMS §3.7.2.9). Returns false, and records the rejection, when no
     /// session is running.
     @discardableResult
     public func stopSession(source: CGMLifecycleEvent.Source = .tester) -> Bool {
@@ -521,7 +521,7 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     // MARK: - Sensor condition (tester UI)
 
-    /// HYD-G-006: a terminal failure. One final record with NaN glucose and Sensor Malfunction goes out so
+    /// A terminal failure. One final record with NaN glucose and Sensor Malfunction goes out so
     /// the collector learns of it, then readings stop; Status keeps the bit and only `replaceSensor()`
     /// recovers. The session stays as it was so RACP can still serve what was stored.
     public func failSensor() {
@@ -533,7 +533,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         }
     }
 
-    /// TBD-05: a recoverable issue. Readings continue with NaN glucose, zero quality and General Device
+    /// A recoverable issue. Readings continue with NaN glucose, zero quality and General Device
     /// Fault, starting with one sent immediately.
     public func beginTemporaryIssue() {
         guard condition == .healthy else { return }
@@ -553,7 +553,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         }
     }
 
-    /// TBD-07: a new sensor. Clears any failure or issue and starts a fresh session (new warm-up, empty
+    /// A new sensor. Clears any failure or issue and starts a fresh session (new warm-up, empty
     /// record and calibration databases). A collector learns of it through Status and the measurements.
     public func replaceSensor() {
         batchingDelegateUpdates {
@@ -584,13 +584,13 @@ public final class MockCGMSensor: @unchecked Sendable {
             notifyStatusRecord()
             return nil
         }
-        // TBD-03: no reading during warm-up. HYD-G-006: a failed sensor produces no readings; the cadence
+        // No reading during warm-up. A failed sensor produces no readings; the cadence
         // keeps sending status-only notifications in both cases.
         guard sessionState == .running, !isWarmingUp, condition != .failed else { return nil }
         return captureReading()
     }
 
-    /// HYD-G-009: the session ends by itself once its run time has elapsed. True when it just did.
+    /// The session ends by itself once its run time has elapsed. True when it just did.
     private func expireSessionIfDue() -> Bool {
         guard sessionState == .running, Int(timeOffset) >= Int(sessionRunTime.hours) * 60 else { return false }
         _ = stopSession(source: .sensor, kind: .sessionExpired)
@@ -623,7 +623,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         alertStatus = alertLevels.annunciation(glucose: last.glucoseConcentration, trend: last.trend, feature: feature.flags)
     }
 
-    /// HYD-G-003: outside the sensor range the boundary is reported with the matching Device Can Process bit.
+    /// Outside the sensor range the boundary is reported with the matching Device Can Process bit.
     /// Nothing is clamped or flagged unless the Feature advertises Sensor Result High-Low Detection.
     private func clampedToSensorRange(_ glucose: Double) -> (glucose: Double, status: CGMSensorStatusAnnunciation) {
         guard feature.flags.contains(.sensorResultHighLowDetection), glucose.isFinite else { return (glucose, []) }
@@ -639,13 +639,13 @@ public final class MockCGMSensor: @unchecked Sendable {
         rangeStatus = lastMeasurement.map { clampedToSensorRange($0.glucoseConcentration).status } ?? []
     }
 
-    /// Fills the database as if the sensor had been running unattended for `duration` (HYD-G-015 test aid):
+    /// Fills the database as if the sensor had been running unattended for `duration` (a backfill test aid):
     /// the session start moves back by that much, so Time Offset jumps, and one record per measurement
     /// interval is generated from the glucose source for the gap. Nothing is notified, exactly as when the
     /// collector is out of range; it learns about the records through RACP. Returns how many were added.
     @discardableResult
     public func backfill(duration: TimeInterval) -> Int {
-        // HYD-G-006: a failed sensor produces no readings, unattended or not. An impaired one still records
+        // A failed sensor produces no readings, unattended or not. An impaired one still records
         // NaN with the fault bit, as the cadence does.
         guard sessionState == .running, condition != .failed, duration > 0 else { return 0 }
         let count = Int(duration / measurementInterval)
@@ -672,11 +672,54 @@ public final class MockCGMSensor: @unchecked Sendable {
         return count
     }
 
+    // MARK: - Persistence
+
+    /// The measurement database and the session it belongs to, in a form a host can encode and put back
+    /// with `restoreHistory(_:)` once the sensor is recreated.
+    public var history: CGMSensorHistory {
+        CGMSensorHistory(records: recordStore.records,
+                         capacity: recordStore.capacity,
+                         sessionState: sessionState,
+                         sessionStartedAt: sessionStartedAt,
+                         sessionStoppedAt: sessionStoppedAt,
+                         sessionStartTime: sessionStartTime,
+                         sessionStartTimeSetByCollector: sessionStartTimeSetByCollector,
+                         measurementCount: measurementCount,
+                         capturedAt: now())
+    }
+
+    /// Puts a persisted database back after a power cycle. The records and their session come back as they
+    /// were, except that a session that was running is now stopped: a restarted sensor does not resume
+    /// measuring, and Time Offset freezes where the snapshot was taken, so RACP serves the same offsets
+    /// against the same Session Start Time. The next Start Session clears it all (CGMS §3.4.5).
+    public func restoreHistory(_ history: CGMSensorHistory) {
+        batchingDelegateUpdates {
+            recordStore = CGMRecordStore(capacity: history.capacity, records: history.records)
+            sessionStartedAt = history.sessionStartedAt
+            sessionStartTime = history.sessionStartTime
+            sessionStartTimeSetByCollector = history.sessionStartTimeSetByCollector
+            measurementCount = history.measurementCount
+            lastMeasurement = recordStore.last
+            switch history.sessionState {
+            case .notStarted:
+                sessionState = .notStarted
+                sessionStoppedAt = nil
+            case .running, .stopped:
+                sessionState = .stopped
+                sessionStoppedAt = history.sessionStoppedAt ?? history.capturedAt
+            }
+            refreshAlertStatus()
+            refreshRangeStatus()
+            ConsoleOut.shared.logMessage(message: "\(#function): \(recordStore.count) records, session \(sessionState), time offset \(timeOffset)")
+            recordLifecycle(.historyRestored, source: .tester, note: "\(recordStore.count) records")
+        }
+    }
+
     /// One CGM Measurement from the glucose source at `elapsed` seconds into the session; consumes a
     /// scenario value when the source is scripted.
     private func makeRecord(elapsed: TimeInterval, timeOffset: UInt16) -> CGMMeasurementRecord {
         let index = scenarioIndex
-        // HYD-C-018: the effects draw from the seeded stream on every reading, inert or not, so the stream
+        // The effects draw from the seeded stream on every reading, inert or not, so the stream
         // stays aligned with the reading count and a session replays identically.
         let sample = traceEffects.apply(to: trace.glucose(elapsed: elapsed, index: index), using: &effectsGenerator)
         var glucose = sample?.rounded() ?? .nan
@@ -685,7 +728,7 @@ public final class MockCGMSensor: @unchecked Sendable {
 
         rangeStatus = []
         if condition != .healthy {
-            // TBD-05 / HYD-G-006: an impaired or failed sensor cannot quantify; the record carries the fault bit.
+            // An impaired or failed sensor cannot quantify; the record carries the fault bit.
             glucose = .nan
             trend = nil
             quality = quality.map { _ in 0 }
@@ -1003,7 +1046,7 @@ public final class MockCGMSensor: @unchecked Sendable {
                 responseCode = .success
             case .startSession:
                 // Also restarts a running session: previous data is discarded (§3.7.2.8). A failed sensor
-                // cannot start one until the tester replaces it (HYD-G-006).
+                // cannot start one until the tester replaces it.
                 responseCode = startSession(source: .collector) ? .success : .procedureNotCompleted
             case .stopSession:
                 // §3.7.2.9: stopping a session that is not running is Op Code not supported.
@@ -1048,7 +1091,7 @@ public final class MockCGMSensor: @unchecked Sendable {
         return data.isCRCValid ? .ok : .invalidCRC
     }
 
-    // MARK: - Integrity fault (HYD-C-009)
+    // MARK: - Integrity fault
 
     /// Armed by the tester; the next read response, notification or indication of a CGMS characteristic goes
     /// out corrupted this way, then the fault clears. See `CGMIntegrityFault`.

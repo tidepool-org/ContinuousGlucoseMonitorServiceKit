@@ -186,7 +186,7 @@ public extension CGMSensorComms {
         sendRACPRequest(CGMRACPRequest(opcode: .reportStoredRecords, racpOperator: racpOperator, minimum: minimum, maximum: maximum), completion: completion)
     }
 
-    /// HYD-G-015: everything after the last Time Offset seen, or all records when nothing was seen yet.
+    /// Backfill: everything after the last Time Offset seen, or all records when nothing was seen yet.
     func reportStoredRecords(after lastTimeOffset: UInt16?, completion: @escaping CGMRACPCompletion) {
         if let lastTimeOffset, lastTimeOffset < UInt16.max {
             reportStoredRecords(.greaterThanOrEqualTo, minimum: lastTimeOffset + 1, completion: completion)
