@@ -187,3 +187,7 @@ extension CGMMeasurementRecord: Equatable {
             && lhs.quality.isSameMeasurement(as: rhs.quality)
     }
 }
+
+/// For the persisted measurement database. Failed readings are NaN glucose, so the host's encoder
+/// needs a non-conforming float strategy.
+extension CGMMeasurementRecord: Codable {}

@@ -27,6 +27,13 @@ public struct CGMRecordStore: Equatable, Sendable {
         self.capacity = max(1, capacity)
     }
 
+    /// A store refilled from persisted records; anything beyond the capacity is trimmed oldest first.
+    public init(capacity: Int, records: [CGMMeasurementRecord]) {
+        self.capacity = max(1, capacity)
+        self.records = records
+        trim()
+    }
+
     public var count: Int { records.count }
     public var isEmpty: Bool { records.isEmpty }
     public var first: CGMMeasurementRecord? { records.first }
@@ -83,5 +90,57 @@ extension Array {
     func chunked(by size: Int) -> [[Element]] {
         let size = Swift.max(1, size)
         return stride(from: 0, to: count, by: size).map { Array(self[$0..<Swift.min($0 + size, count)]) }
+    }
+}
+
+// MARK: - Persistence
+
+/// What a host persists so the sensor's measurement database survives a restart: the records and
+/// the session they belong to, so RACP serves the same Time Offsets against the same Session Start Time.
+public struct CGMSensorHistory: Codable, Sendable {
+    public var records: [CGMMeasurementRecord]
+    public var capacity: Int
+    public var sessionState: CGMSessionState
+    public var sessionStartedAt: Date
+    public var sessionStoppedAt: Date?
+    public var sessionStartTime: CGMSessionStartTime?
+    public var sessionStartTimeSetByCollector: Bool
+    public var measurementCount: Int
+    /// When the snapshot was taken; a session that was running freezes its Time Offset here on restore.
+    public var capturedAt: Date
+
+    public init(records: [CGMMeasurementRecord],
+                capacity: Int,
+                sessionState: CGMSessionState,
+                sessionStartedAt: Date,
+                sessionStoppedAt: Date?,
+                sessionStartTime: CGMSessionStartTime?,
+                sessionStartTimeSetByCollector: Bool,
+                measurementCount: Int,
+                capturedAt: Date)
+    {
+        self.records = records
+        self.capacity = capacity
+        self.sessionState = sessionState
+        self.sessionStartedAt = sessionStartedAt
+        self.sessionStoppedAt = sessionStoppedAt
+        self.sessionStartTime = sessionStartTime
+        self.sessionStartTimeSetByCollector = sessionStartTimeSetByCollector
+        self.measurementCount = measurementCount
+        self.capturedAt = capturedAt
+    }
+}
+
+extension CGMSensorHistory: Equatable {
+    /// `capturedAt` is left out so a host can diff snapshots and save only when the database changed.
+    public static func == (lhs: CGMSensorHistory, rhs: CGMSensorHistory) -> Bool {
+        lhs.records == rhs.records
+            && lhs.capacity == rhs.capacity
+            && lhs.sessionState == rhs.sessionState
+            && lhs.sessionStartedAt == rhs.sessionStartedAt
+            && lhs.sessionStoppedAt == rhs.sessionStoppedAt
+            && lhs.sessionStartTime == rhs.sessionStartTime
+            && lhs.sessionStartTimeSetByCollector == rhs.sessionStartTimeSetByCollector
+            && lhs.measurementCount == rhs.measurementCount
     }
 }

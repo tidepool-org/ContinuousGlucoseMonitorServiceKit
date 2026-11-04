@@ -10,7 +10,7 @@ import Foundation
 
 /// Perturbations layered on any glucose source (CGM-DESIGN §Glucose trace): gaussian noise, occasional
 /// outliers, and a chance of a reading failing outright. Every draw comes from a generator seeded from
-/// `seed` and re-seeded at Start Session, so a session replays identically (HYD-C-018).
+/// `seed` and re-seeded at Start Session, so a session replays identically.
 public struct CGMTraceEffects: Equatable, Codable, Sendable {
     /// Standard deviation of the noise added to every reading, mg/dL. 0 = none.
     public var noiseStandardDeviation: Double

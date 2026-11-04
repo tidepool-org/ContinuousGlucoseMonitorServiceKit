@@ -146,7 +146,7 @@ struct MockCGMSensorRecordTests {
         #expect(racpResponses.last == Data([0x05, 0x00, 0x00, 0x00]))
     }
 
-    /// Backfill (HYD-G-015): the collector asks for everything after the last offset it saw.
+    /// Backfill: the collector asks for everything after the last offset it saw.
     @Test func reportStoredRecordsNotifiesTheSelectionThenIndicatesSuccess() throws {
         accumulate(5)
         server.subscribed.formUnion([CGMCharacteristicUUID.measurement.cbUUID, CGMCharacteristicUUID.recordAccessControlPoint.cbUUID])
@@ -273,5 +273,64 @@ struct MockCGMSensorRecordTests {
         #expect(sensor.backfill(duration: 0) == 0)
         #expect(sensor.backfill(duration: 10) == 0)          // shorter than one interval
         #expect(sensor.recordStore.isEmpty)
+    }
+}
+
+// MARK: - Persistence
+
+@Suite("Sensor history persistence")
+struct MockCGMSensorHistoryTests {
+    @Test func historyRoundTripsThroughAFreshSensor() throws {
+        let box = ClockBox(Date(timeIntervalSince1970: 1_700_000_000))
+        let server = MockGATTService()
+        let queue = MockMessageQueue(gattServer: server)
+        let sensor = MockCGMSensor(gattServer: server, messageQueue: queue, now: { box.now })
+        sensor.measurementInterval = 60
+        sensor.startSession()
+        for _ in 0..<3 {
+            box.now = box.now.addingTimeInterval(60)
+            sensor.takeMeasurement()
+        }
+        let history = sensor.history
+        #expect(history.records.count == 3)
+        #expect(history.sessionState == .running)
+        #expect(history.capturedAt == box.now)
+
+        // The host stores it as JSON; the comparison ignores capturedAt by design.
+        let decoded = try JSONDecoder().decode(CGMSensorHistory.self, from: JSONEncoder().encode(history))
+        #expect(decoded == history)
+
+        // A power cycle later, the records and their session come back, with the session stopped where the
+        // snapshot was taken rather than still counting.
+        box.now = box.now.addingTimeInterval(600)
+        let restored = MockCGMSensor(gattServer: server, messageQueue: queue, now: { box.now })
+        restored.restoreHistory(decoded)
+        #expect(restored.recordStore.records == history.records)
+        #expect(restored.recordStore.capacity == history.capacity)
+        #expect(restored.sessionState == .stopped)
+        #expect(restored.sessionStartTime == history.sessionStartTime)
+        #expect(restored.timeOffset == 3)
+        #expect(restored.measurementCount == 3)
+        #expect(restored.lastMeasurement == history.records.last)
+        #expect(restored.lifecycleEvents.last?.kind == .historyRestored)
+        // The restored snapshot differs only in the session having been stopped at the capture instant.
+        #expect(restored.history.sessionState == .stopped)
+        #expect(restored.history.sessionStoppedAt == history.capturedAt)
+        #expect(restored.history.records == history.records)
+    }
+
+    @Test func restoringAnUnstartedHistoryLeavesTheSessionUnstarted() {
+        let server = MockGATTService()
+        let queue = MockMessageQueue(gattServer: server)
+        let sensor = MockCGMSensor(gattServer: server, messageQueue: queue)
+        let history = sensor.history
+        #expect(history.sessionState == .notStarted)
+        #expect(history.records.isEmpty)
+
+        let restored = MockCGMSensor(gattServer: server, messageQueue: queue)
+        restored.restoreHistory(history)
+        #expect(restored.sessionState == .notStarted)
+        #expect(restored.timeOffset == 0)
+        #expect(restored.recordStore.isEmpty)
     }
 }

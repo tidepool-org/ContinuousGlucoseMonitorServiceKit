@@ -8,7 +8,7 @@
 
 import Foundation
 
-/// A scripted glucose trace (HYD-C-017): an ordered list of mg/dL values. Each measurement takes the next
+/// A scripted glucose trace: an ordered list of mg/dL values. Each measurement takes the next
 /// value regardless of wall-clock time, so the trace plays at whatever cadence the tester picks. At the end
 /// it either starts over or holds the final value.
 public struct CGMGlucoseScenario: Equatable, Codable, Sendable {

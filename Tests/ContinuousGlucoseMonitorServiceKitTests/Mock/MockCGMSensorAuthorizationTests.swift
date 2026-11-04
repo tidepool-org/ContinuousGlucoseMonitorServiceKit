@@ -247,7 +247,7 @@ struct MockCGMSensorAuthorizationTests {
         #expect(queue.items.contains { $0.uuid == ACCharacteristicUUID.status.cbUUID })
     }
 
-    /// A host persisting the pairing (HYDRA-9) needs every key and nonce change: the exchange sets the key,
+    /// A host persisting the pairing needs every key and nonce change: the exchange sets the key,
     /// each secure indication steps the sequence number, and Invalidate drops the key.
     @Test func securityChangesReachTheDelegate() {
         let spy = DelegateSpy()

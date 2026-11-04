@@ -204,7 +204,7 @@ struct ContinuousGlucoseMonitorServiceTests {
     }
 
     /// A confirmed key survives a link loss, as in the pump kit: the sensor keeps its copy and the nonce
-    /// sequence keeps counting, so the next link resumes the secure channel without an exchange (HYDRA-9).
+    /// sequence keeps counting, so the next link resumes the secure channel without an exchange.
     @Test func linkLossKeepsTheSessionKey() {
         service.sharedKeyData = Data([1, 2, 3])
         receiveACStatus(restrictionMapID: 1, established: true)

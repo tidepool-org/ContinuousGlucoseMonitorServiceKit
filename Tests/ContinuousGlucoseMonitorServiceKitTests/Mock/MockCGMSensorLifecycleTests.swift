@@ -34,7 +34,7 @@ struct MockCGMSensorLifecycleTests {
         return CGMSpecificOpsResponseCode(rawValue: code)
     }
 
-    // MARK: Warm-up (TBD-03)
+    // MARK: Warm-up
 
     @Test func warmupSuppressesReadingsAndIsEditableLive() throws {
         sensor.warmupDuration = 60
@@ -65,7 +65,7 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.takeMeasurement() != nil)
     }
 
-    // MARK: Sensor failure (HYD-G-006)
+    // MARK: Sensor failure
 
     @Test func failedSensorStopsReportingUntilReplaced() throws {
         server.subscribed.insert(CGMCharacteristicUUID.measurement.cbUUID)
@@ -111,7 +111,7 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.takeMeasurement() != nil)
     }
 
-    // MARK: Temporary issue (TBD-05)
+    // MARK: Temporary issue
 
     @Test func temporaryIssueReportsNaNWithFaultBitUntilResolved() throws {
         sensor.startSession()
@@ -143,7 +143,7 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.lifecycleEvents.suffix(2).map(\.kind) == [.temporaryIssueBegan, .temporaryIssueResolved])
     }
 
-    // MARK: Sensor range (HYD-G-003)
+    // MARK: Sensor range
 
     @Test func readingsOutsideTheSensorRangeAreClampedAndFlagged() throws {
         sensor.feature.flags.insert(.sensorResultHighLowDetection)
@@ -186,7 +186,7 @@ struct MockCGMSensorLifecycleTests {
         #expect(raw.sensorStatus.isDisjoint(with: [.resultLowerThanDeviceCanProcess, .resultHigherThanDeviceCanProcess]))
     }
 
-    // MARK: Lifecycle record (TBD-07/08)
+    // MARK: Lifecycle record
 
     @Test func lifecycleEventsRecordSourceAcceptanceAndConnection() throws {
         // Stop with nothing running: rejected, from the collector, no subscriber.
@@ -206,7 +206,7 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.lifecycleEvents.count == 3)
     }
 
-    // MARK: Run time (HYD-G-009)
+    // MARK: Run time
 
     @Test func sessionExpiresWhenRunTimeElapses() throws {
         sensor.sessionRunTime = CGMSessionRunTime(hours: 1)
@@ -251,7 +251,7 @@ struct MockCGMSensorLifecycleTests {
         #expect(afterEdit > 0.9 && afterEdit <= 1.0, "cadence should restart from the edit, got \(afterEdit)")
     }
 
-    // MARK: Device clock (HYD-C-015/016)
+    // MARK: Device clock
 
     /// The skew is captured at Start Session and shows only in Session Start Time; Time Offset, warm-up and
     /// the lifecycle log run on the host clock, and a mid-session change waits for the next session.
