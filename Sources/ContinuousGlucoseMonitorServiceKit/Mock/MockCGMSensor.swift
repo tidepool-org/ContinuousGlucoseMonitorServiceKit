@@ -512,7 +512,10 @@ public final class MockCGMSensor: @unchecked Sendable {
         batchingDelegateUpdates {
             sessionStoppedAt = now()
             sessionState = .stopped
-            // The cadence keeps ticking with status-only notifications (Session Stopped bit).
+            // One stopped record goes into the database at the frozen offset, so a collector that was away
+            // finds the stop through RACP by Time Offset like any other event. The cadence keeps ticking
+            // with status-only notifications (Session Stopped bit) that are not stored.
+            recordStore.append(makeStatusRecord())
             ConsoleOut.shared.logMessage(message: "\(#function): session stopped at time offset \(timeOffset)")
             recordLifecycle(kind, source: source)
         }
@@ -699,7 +702,8 @@ public final class MockCGMSensor: @unchecked Sendable {
             sessionStartTime = history.sessionStartTime
             sessionStartTimeSetByCollector = history.sessionStartTimeSetByCollector
             measurementCount = history.measurementCount
-            lastMeasurement = recordStore.last
+            // The newest record may be the stop marker; the last reading is the last one with a value.
+            lastMeasurement = recordStore.records.last { $0.glucoseConcentration.isFinite }
             switch history.sessionState {
             case .notStarted:
                 sessionState = .notStarted
@@ -811,15 +815,21 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     /// A record carrying only Time Offset and the status bits: NaN glucose, no trend, zero quality. This is
     /// how a stopped, warming-up or failed sensor keeps talking to the collector, since CGM Status itself
-    /// cannot be notified (CGMS Table 3.1). Notified, never stored: it is not a measurement.
-    private func notifyStatusRecord() {
-        let record = CGMMeasurementRecord(
+    /// cannot be notified (CGMS Table 3.1).
+    private func makeStatusRecord() -> CGMMeasurementRecord {
+        CGMMeasurementRecord(
             glucoseConcentration: .nan,
             timeOffset: timeOffset,
             sensorStatus: sensorStatus,
             trend: nil,
             quality: feature.flags.contains(.quality) ? 0 : nil
         )
+    }
+
+    /// Notified, not stored: a cadence tick without a measurement is not history. The one exception is the
+    /// record `stopSession` stores at the moment of the stop.
+    private func notifyStatusRecord() {
+        let record = makeStatusRecord()
         lastStatusRecord = record
         ConsoleOut.shared.logMessage(message: "status notification: \(record)")
         if isPeriodicCommunicationEnabled { notifyMeasurements([record]) }

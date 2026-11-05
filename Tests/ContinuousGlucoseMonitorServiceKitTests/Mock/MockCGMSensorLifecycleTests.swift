@@ -206,6 +206,35 @@ struct MockCGMSensorLifecycleTests {
         #expect(sensor.lifecycleEvents.count == 3)
     }
 
+    /// A stop leaves one stored record at the frozen offset with the Session Stopped bit, so a collector that
+    /// was away finds it through RACP by Time Offset. The cadence ticks that follow are notified, not stored.
+    @Test func stopStoresOneStatusRecordForRACP() throws {
+        sensor.startSession()
+        box.now = startedAt.addingTimeInterval(5 * 60)
+        #expect(sensor.takeMeasurement() != nil)
+        let before = sensor.recordStore.count
+
+        box.now = startedAt.addingTimeInterval(7 * 60)
+        #expect(sensor.stopSession())
+        #expect(sensor.recordStore.count == before + 1)
+        let stopped = try #require(sensor.recordStore.last)
+        #expect(stopped.glucoseConcentration.isNaN)
+        #expect(stopped.timeOffset == 7)
+        #expect(stopped.sensorStatus.contains(.sessionStopped))
+        #expect(sensor.recordStore.select(.greaterThanOrEqualTo, minimum: 6).map(\.timeOffset) == [7])
+        #expect(sensor.lastMeasurement?.glucoseConcentration.isFinite == true)
+
+        box.now = startedAt.addingTimeInterval(12 * 60)
+        #expect(sensor.takeMeasurement() == nil)
+        #expect(sensor.recordStore.count == before + 1)
+
+        // The stop marker survives a restart like any other record, and the last reading stays the last value.
+        let restored = MockCGMSensor(gattServer: server, messageQueue: queue, now: { [box] in box.now })
+        restored.restoreHistory(sensor.history)
+        #expect(restored.recordStore.last?.sensorStatus.contains(.sessionStopped) == true)
+        #expect(restored.lastMeasurement?.glucoseConcentration.isFinite == true)
+    }
+
     // MARK: Run time
 
     @Test func sessionExpiresWhenRunTimeElapses() throws {
