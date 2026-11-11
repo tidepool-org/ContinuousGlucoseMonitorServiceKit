@@ -40,6 +40,14 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     public weak var delegate: MockCGMSensorDelegate?
 
+    /// The tester's answer to collector commands on the CGMCP; holds until changed. The host shows and sets it.
+    public var commandResponseOverride: CGMCommandResponseOverride = .normal {
+        didSet {
+            guard oldValue != commandResponseOverride else { return }
+            notifyDelegate()
+        }
+    }
+
     /// CGMS requires authenticated links for every characteristic; `true` makes iOS pair and bond. Off by
     /// default so testing needs no bond (Nate, 2026-10-09); ACS will provide the application-layer channel.
     /// Fixed at creation because CoreBluetooth permissions cannot change after the service is published.
@@ -1003,6 +1011,27 @@ public final class MockCGMSensor: @unchecked Sendable {
             return .success
         }
 
+        // The tester's override applies to commands only; a well-formed request is answered (or not) as chosen.
+        var withholdResponse = false
+        if Self.commandOpcodes.contains(opcode), commandResponseOverride != .normal {
+            ConsoleOut.shared.logMessage(message: "\(#function): response override \(commandResponseOverride) for \(opcode)")
+            switch commandResponseOverride {
+            case .refuse:
+                // CGMS has no "not applicable" code; Op Code Not Supported is how a sensor declines a command.
+                indicateSpecificOpsResponse(request: requestOpcode, code: .opCodeNotSupported)
+                return .success
+            case .fail:
+                indicateSpecificOpsResponse(request: requestOpcode, code: .procedureNotCompleted)
+                return .success
+            case .uncertainNotExecuted:
+                return .success
+            case .uncertainExecuted:
+                withholdResponse = true
+            case .normal:
+                break
+            }
+        }
+
         // Size and CRC are verified, so the operand is exactly `encodedSize` octets after the op code.
         var reader = CGMDataReader(data.dropFirst().prefix(operand.encodedSize))
         let responseCode: CGMSpecificOpsResponseCode
@@ -1071,9 +1100,19 @@ public final class MockCGMSensor: @unchecked Sendable {
             ConsoleOut.shared.logMessage(message: "\(#function): rejected operand: \(error)")
             responseCode = .invalidOperand
         }
-        indicateSpecificOpsResponse(request: requestOpcode, code: responseCode)
+        if !withholdResponse {
+            indicateSpecificOpsResponse(request: requestOpcode, code: responseCode)
+        }
         return .success
     }
+
+    /// The CGMCP op codes that change the sensor; the override leaves the Get op codes alone.
+    static let commandOpcodes: Set<CGMSpecificOpsOpcode> = [
+        .setCommunicationInterval, .setGlucoseCalibrationValue,
+        .setPatientHighAlertLevel, .setPatientLowAlertLevel, .setHypoAlertLevel, .setHyperAlertLevel,
+        .setRateOfDecreaseAlertLevel, .setRateOfIncreaseAlertLevel,
+        .resetDeviceSpecificAlert, .startSession, .stopSession,
+    ]
 
     private func indicateSpecificOpsResponse(request: UInt8, code: CGMSpecificOpsResponseCode) {
         indicateSpecificOps(.responseCode(request: request, code: code.rawValue))

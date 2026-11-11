@@ -10,6 +10,29 @@
 
 import Foundation
 
+// MARK: - Command response override
+
+/// What the sensor answers to a collector's commands on the CGM Specific Ops Control Point, as a tester
+/// chooses: the real answer, a refusal, a failure, or silence with the command either run or dropped. Queries
+/// (the Get op codes) always get their real answer.
+public enum CGMCommandResponseOverride: String, CaseIterable, Sendable, CustomStringConvertible {
+    case normal
+    case refuse
+    case fail
+    case uncertainExecuted
+    case uncertainNotExecuted
+
+    public var description: String {
+        switch self {
+        case .normal: return "Normal"
+        case .refuse: return "Refuse"
+        case .fail: return "Fail"
+        case .uncertainExecuted: return "Uncertain (executed)"
+        case .uncertainNotExecuted: return "Uncertain (not executed)"
+        }
+    }
+}
+
 // MARK: - Alert levels (§3.7.2.3 – §3.7.2.6)
 
 /// Thresholds in mg/dL (levels) and mg/dL/min (rates). A Rate of Decrease level is negative: the bit trips
