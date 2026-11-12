@@ -47,6 +47,25 @@ struct MockCGMSensorOutOfRangeTests {
         #expect(sensor.pendingGlucoseOverride == nil)
     }
 
+    /// A stale reading claims an earlier Time Offset than the moment it is taken; the next reading is current again.
+    @Test func staleReadingIsDatedBackAndClampsAtSessionStart() throws {
+        let clock = ClockBox(Date())
+        let sensor = MockCGMSensor(gattServer: server, messageQueue: queue, now: { clock.now })
+        sensor.startSession()
+        clock.now = clock.now.addingTimeInterval(30 * 60)   // thirty minutes into the session
+        #expect(sensor.timeOffset == 30)
+
+        let stale = try #require(sensor.reportReading(glucose: 120, minutesOld: 10))
+        #expect(stale.timeOffset == 20)
+        #expect(sensor.pendingStaleMinutes == nil)
+
+        let clamped = try #require(sensor.reportReading(glucose: 120, minutesOld: 10_000))
+        #expect(clamped.timeOffset == 0, "never before the session start")
+
+        let fresh = try #require(sensor.takeMeasurement())
+        #expect(fresh.timeOffset == sensor.timeOffset)
+    }
+
     @Test func nothingIsSentWithoutASessionAndTheOverrideIsDropped() {
         sensor.stopSession()
         #expect(sensor.reportReading(glucose: 700) == nil)

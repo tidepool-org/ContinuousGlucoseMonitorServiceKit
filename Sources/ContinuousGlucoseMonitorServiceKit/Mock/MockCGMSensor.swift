@@ -590,12 +590,20 @@ public final class MockCGMSensor: @unchecked Sendable {
     /// the SFLOAT can carry. A tester's out-of-range value; one reading consumes it.
     public var pendingGlucoseOverride: Double? = nil
 
-    /// Takes a reading now that reports `glucose` as is. nil when the sensor cannot read (no session, warming
-    /// up, failed), in which case nothing is sent and the override is dropped.
+    /// Minutes the next reading's Time Offset is set back, so the record claims an earlier moment in the session
+    /// than the one it is taken at: a tester's stale value. One reading consumes it; never before session start.
+    public var pendingStaleMinutes: Int? = nil
+
+    /// Takes a reading now that reports `glucose` as is, dated `minutesOld` minutes back. nil when the sensor
+    /// cannot read (no session, warming up, failed), in which case nothing is sent and the overrides are dropped.
     @discardableResult
-    public func reportReading(glucose: Double) -> CGMMeasurementRecord? {
+    public func reportReading(glucose: Double, minutesOld: Int = 0) -> CGMMeasurementRecord? {
         pendingGlucoseOverride = glucose
-        defer { pendingGlucoseOverride = nil }
+        pendingStaleMinutes = minutesOld > 0 ? minutesOld : nil
+        defer {
+            pendingGlucoseOverride = nil
+            pendingStaleMinutes = nil
+        }
         return takeMeasurement()
     }
 
@@ -751,6 +759,14 @@ public final class MockCGMSensor: @unchecked Sendable {
         var trend = feature.flags.contains(.trendInformation) ? (trace.trend(elapsed: elapsed, index: index) * 10).rounded() / 10 : nil
         var quality: Double? = feature.flags.contains(.quality) ? 100 : nil
 
+        // A stale reading claims an earlier Time Offset; the status bits it carries are those of that moment too.
+        var recordOffset = timeOffset
+        if let stale = pendingStaleMinutes {
+            pendingStaleMinutes = nil
+            recordOffset = UInt16(max(0, Int(timeOffset) - stale))
+            ConsoleOut.shared.logMessage(message: "\(#function): dating the reading \(stale) min back, time offset \(timeOffset) → \(recordOffset)")
+        }
+
         rangeStatus = []
         if let forced = pendingGlucoseOverride {
             // The tester's value goes out untouched: no clamp, no range bit, whatever the sensor's condition.
@@ -779,8 +795,8 @@ public final class MockCGMSensor: @unchecked Sendable {
         }
         let record = CGMMeasurementRecord(
             glucoseConcentration: glucose,
-            timeOffset: timeOffset,
-            sensorStatus: sensorStatus(at: timeOffset),   // a backfilled record carries its own moment's bits
+            timeOffset: recordOffset,
+            sensorStatus: sensorStatus(at: recordOffset),   // a backfilled record carries its own moment's bits
             trend: trend,
             quality: quality
         )
