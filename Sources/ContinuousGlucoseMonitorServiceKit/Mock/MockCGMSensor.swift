@@ -586,6 +586,19 @@ public final class MockCGMSensor: @unchecked Sendable {
 
     // MARK: - Measurements
 
+    /// A glucose the next reading reports exactly as given: no range clamp, no Device Can Process bit, whatever
+    /// the SFLOAT can carry. A tester's out-of-range value; one reading consumes it.
+    public var pendingGlucoseOverride: Double? = nil
+
+    /// Takes a reading now that reports `glucose` as is. nil when the sensor cannot read (no session, warming
+    /// up, failed), in which case nothing is sent and the override is dropped.
+    @discardableResult
+    public func reportReading(glucose: Double) -> CGMMeasurementRecord? {
+        pendingGlucoseOverride = glucose
+        defer { pendingGlucoseOverride = nil }
+        return takeMeasurement()
+    }
+
     /// Samples the trace, records the result and notifies a subscribed collector (CGMS §3.1.1 periodic
     /// notification). Also callable from the tester UI for an out-of-cadence reading.
     @discardableResult
@@ -739,7 +752,12 @@ public final class MockCGMSensor: @unchecked Sendable {
         var quality: Double? = feature.flags.contains(.quality) ? 100 : nil
 
         rangeStatus = []
-        if condition != .healthy {
+        if let forced = pendingGlucoseOverride {
+            // The tester's value goes out untouched: no clamp, no range bit, whatever the sensor's condition.
+            pendingGlucoseOverride = nil
+            glucose = forced
+            ConsoleOut.shared.logMessage(message: "\(#function): reporting tester glucose \(forced) mg/dL unclamped")
+        } else if condition != .healthy {
             // An impaired or failed sensor cannot quantify; the record carries the fault bit.
             glucose = .nan
             trend = nil
